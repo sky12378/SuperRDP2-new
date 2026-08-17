@@ -198,12 +198,14 @@ BOOL __stdcall GetFileVersion(LPCWSTR lptstrFilename, FILE_VERSION *FileVersion)
     HRSRC hResourceInfo = FindResourceW(hFile, (LPCWSTR)1, (LPCWSTR)0x10);
     if (!hResourceInfo)
     {
+        FreeLibrary(hFile);
         return false;
     }
 
     VS_VERSIONINFO *VersionInfo = (VS_VERSIONINFO*)LoadResource(hFile, hResourceInfo);
     if (!VersionInfo)
     {
+        FreeLibrary(hFile);
         return false;
     }
 
@@ -211,5 +213,7 @@ BOOL __stdcall GetFileVersion(LPCWSTR lptstrFilename, FILE_VERSION *FileVersion)
     FileVersion->Release = (WORD)(VersionInfo->Value.dwFileVersionLS >> 16);
     FileVersion->Build = (WORD)VersionInfo->Value.dwFileVersionLS;
 
+    // 版本数据已拷贝到出参，映射不再需要，成功路径也要释放
+    FreeLibrary(hFile);
     return true;
 }

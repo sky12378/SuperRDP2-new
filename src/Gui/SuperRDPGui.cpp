@@ -82,7 +82,6 @@ static volatile LONG g_bBusy = 0;
 static HFONT g_hFont = NULL;
 static bool g_autoSupport = false;
 static bool g_bootAuto = false;
-static bool g_silent = false;
 static bool g_statusLoggedOnce = false;
 static HWND g_val[5] = {0};         // sysver / supp / state / auto / svc values
 static wchar_t g_szLogFile[MAX_PATH] = {0};
@@ -544,16 +543,36 @@ static void AppendToLogMB(const char* s, DWORD len)
     if (len) memcpy(p + g_mbLeftLen, s, len);
     g_mbLeftLen = 0;
 
-    // 块尾若是 DBCS 引导字节，说明字符被读边界劈开：保留到下一块再解码
+    // 块尾若是未闭合的多字节字符，说明被读边界劈开：保留到下一块再解码
     // （仅当本次确有新数据时才缓存；len==0 表示收尾 flush，直接解码残留字节）
     UINT cp = ChildOutputCP();
-    CPINFO ci;
     DWORD cont = total;
-    if (cont > 0 && len > 0 && GetCPInfo(cp, &ci) && ci.MaxCharSize > 1 && ci.LeadByte[0] != 0) {
-        if (IsDBCSLeadByteEx(cp, (BYTE)p[cont - 1])) {
-            g_mbLeft[0] = p[cont - 1];
-            g_mbLeftLen = 1;
-            cont--;
+    if (cont > 0 && len > 0) {
+        if (cp == 65001) {
+            // UTF-8 OEM 码页没有 DBCS 引导字节范围，需自行检查块尾：
+            // 从尾部向前（最多 4 字节）找字符起始字节，声明长度 > 已有字节数即为未闭合尾巴
+            DWORD keep = 0;
+            for (DWORD t = 1; t <= 4 && t <= cont; t++) {
+                BYTE b = (BYTE)p[cont - t];
+                if ((b & 0xC0) != 0x80) {
+                    int need = (b & 0x80) == 0 ? 1 : ((b & 0xE0) == 0xC0) ? 2 : ((b & 0xF0) == 0xE0) ? 3 : 4;
+                    if ((int)t < need) keep = t;
+                    break;
+                }
+            }
+            if (keep) {   // 未闭合尾巴最长 3 字节，g_mbLeft[4] 足够
+                memcpy(g_mbLeft, p + cont - keep, keep);
+                g_mbLeftLen = (int)keep;
+                cont -= keep;
+            }
+        } else {
+            CPINFO ci;
+            if (GetCPInfo(cp, &ci) && ci.MaxCharSize > 1 && ci.LeadByte[0] != 0 &&
+                IsDBCSLeadByteEx(cp, (BYTE)p[cont - 1])) {
+                g_mbLeft[0] = p[cont - 1];
+                g_mbLeftLen = 1;
+                cont--;
+            }
         }
     }
     if (!cont) return;
@@ -563,7 +582,9 @@ static void AppendToLogMB(const char* s, DWORD len)
     std::vector<wchar_t> w(n + 3);
     MultiByteToWideChar(cp, 0, p, (int)cont, w.data(), n);
     int end = n;
-    if (n >= 1 && w[n - 1] == L'\n') { w[n - 1] = L'\r'; w[n] = L'\n'; end = n + 1; }
+    // 行尾规范化为 \r\n：已是 \r\n 则保持原样，再补 \r 会产生 \r\r\n 双回车
+    if (n >= 2 && w[n - 2] == L'\r' && w[n - 1] == L'\n') { end = n; }
+    else if (n >= 1 && w[n - 1] == L'\n') { w[n - 1] = L'\r'; w[n] = L'\n'; end = n + 1; }
     else { w[n] = L'\r'; w[n + 1] = L'\n'; end = n + 2; }
     w[end] = 0;
     LogToFile(w.data());
@@ -581,8 +602,6 @@ static void AppendToLogMB(const char* s, DWORD len)
         }
     }
 }
-
-struct ChildCtx { HANDLE inW; };
 
 // runs console installer, feeds option ("1"/"2"/"3"), streams output into log.
 // returns child exit code; -1 on create failure
@@ -870,6 +889,7 @@ static bool SetBoot(bool on)
 // ---------------- live status (replicates SuperRDP2 real-time check) ----------------
 struct StatusInfo {
     bool installed, supported, svcRunning, listening;
+    wchar_t osver[64];     // OS 版本号（RtlGetVersion，不受 manifest 版本谎言影响）
     wchar_t termsrv[64];   // local termsrv.dll version
     wchar_t latest[64];    // newest build supported by the (online-synced) ini
 };
@@ -944,10 +964,26 @@ static bool IsInstalled()
     return on;
 }
 
+// RtlGetVersion 返回真实 OS 版本；GetVersionEx 在无对应 manifest 时会谎报 6.2
+static void QueryOSVersion(wchar_t* out, size_t cch)
+{
+    typedef LONG (WINAPI *RTLGETVERSION)(PRTL_OSVERSIONINFOW);
+    RTL_OSVERSIONINFOW ov;
+    memset(&ov, 0, sizeof(ov));
+    ov.dwOSVersionInfoSize = sizeof(ov);
+    out[0] = 0;
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    RTLGETVERSION fn = ntdll ? (RTLGETVERSION)(void*)GetProcAddress(ntdll, "RtlGetVersion") : NULL;
+    if (fn && fn(&ov) == 0)
+        _snwprintf(out, cch, L"%lu.%lu.%lu", ov.dwMajorVersion, ov.dwMinorVersion, ov.dwBuildNumber);
+    if (cch) out[cch - 1] = 0;
+}
+
 static void QueryStatus(StatusInfo& s)
 {
     memset(&s, 0, sizeof(s));
     s.installed = IsInstalled();
+    QueryOSVersion(s.osver, 64);
 
     wchar_t sys[MAX_PATH], dll[MAX_PATH];
     GetSystemDirectoryW(sys, MAX_PATH);
@@ -1010,9 +1046,11 @@ static int ActiveSessions()
 // UI thread only
 static void UpdateStatusUI(const StatusInfo& s)
 {
-    // 系统版本：/ termsrv：/ 状态：/ 自动分析：/ termsrv服务： rows
-    SetWindowTextW(g_val[0], s.termsrv[0] ? s.termsrv : L"未知");
-    SetWindowTextW(g_val[1], s.latest[0] ? s.latest : L"—");
+    // 系统版本：/ termsrv：/ 状态：/ 在线会话：/ termsrv服务： rows
+    // 原实现把 termsrv 版本填到「系统版本」行、把 ini 最高支持版本填到「termsrv」行，
+    // 名实不符；现系统版本行显示真实 OS 版本，termsrv 行显示本地 dll 版本
+    SetWindowTextW(g_val[0], s.osver[0] ? s.osver : L"未知");
+    SetWindowTextW(g_val[1], s.termsrv[0] ? s.termsrv : L"—");
     SetWindowTextW(g_val[2], s.installed ? L"已安装" : L"未安装");
     int sess = ActiveSessions();
     wchar_t conn[32]; _snwprintf(conn, 32, L"%d/9999", sess);
@@ -1034,8 +1072,17 @@ static void UpdateStatusUI(const StatusInfo& s)
     if (g_hStatus) {
         if (!s.installed)
             SetWindowTextW(g_hStatus, L"server is wrong.");
-        else if (!s.supported)
-            SetWindowTextW(g_hStatus, L"已安装，但当前 termsrv 版本尚未被配置支持（请同步最新配置并开启自动分析）");
+        else if (!s.supported) {
+            // 附上 ini 当前能支持的最高版本，便于判断是本地太新还是配置太旧
+            wchar_t msg[192];
+            if (s.latest[0])
+                _snwprintf(msg, 192, L"已安装，但 termsrv %ls 尚未被配置支持（ini 最新 %ls，请同步并开启自动分析）",
+                           s.termsrv, s.latest);
+            else
+                _snwprintf(msg, 192, L"已安装，但当前 termsrv 版本尚未被配置支持（请同步最新配置并开启自动分析）");
+            msg[191] = 0;
+            SetWindowTextW(g_hStatus, msg);
+        }
         else if (!s.svcRunning)
             SetWindowTextW(g_hStatus, L"已安装且已支持，但终端服务未运行（点击 启动）");
         else if (!s.listening)
@@ -1110,10 +1157,18 @@ static bool ControlTermService(bool start)
     bool ok = false;
     if (start) {
         if (StartServiceW(svc, 0, NULL)) ok = true;
+        else if (GetLastError() == ERROR_SERVICE_ALREADY_RUNNING) {
+            Log(L"[*] TermService 已在运行");
+            ok = true;   // 已在运行不算失败
+        }
         else Log(L"[-] 启动 TermService 失败: %u", GetLastError());
     } else {
         SERVICE_STATUS st = {0};
         if (ControlService(svc, SERVICE_CONTROL_STOP, &st)) ok = true;
+        else if (GetLastError() == 1062 /* ERROR_SERVICE_NOT_RUNNING，MinGW 头文件未定义该宏 */) {
+            Log(L"[*] TermService 未处于运行状态");
+            ok = true;   // 本来就没运行，停止自然算达成
+        }
         else Log(L"[-] 停止 TermService 失败: %u", GetLastError());
     }
     CloseServiceHandle(svc);
@@ -1136,7 +1191,14 @@ static DWORD WINAPI Worker(LPVOID p)
             Log(L"[*] AutoSupport：检查并自动支持当前系统…");
             EnsureSupported(true);
         }
-        RunInstaller(L"1");
+        // 菜单选项 1 在已安装时会被安装器早退（点了没反应），
+        // 要让安装按钮在已安装状态下也能重新应用配置/dll，必须走 update 路径
+        if (IsInstalled()) {
+            Log(L"[*] 检测到已安装，走 update 路径重新安装…");
+            RunInstaller(L"\n", L"update");
+        } else {
+            RunInstaller(L"1");
+        }
         Log(L"========= 安装流程结束 =========");
         break;
     case ID_BTN_UNINSTALL:
@@ -1149,24 +1211,32 @@ static DWORD WINAPI Worker(LPVOID p)
         RunInstaller(L"3");
         Log(L"========= 重启完成 =========");
         break;
-    case ID_BTN_SYNC:
+    case ID_BTN_SYNC: {
         Log(L"========= 同步最新配置 =========");
-        if (DownloadIni((wchar_t*)IniPath().c_str(), true, NULL)) {
-            if (g_autoSupport) EnsureSupported(true);
+        bool iniChanged = false;
+        if (DownloadIni((wchar_t*)IniPath().c_str(), true, &iniChanged)) {
+            int st = g_autoSupport ? EnsureSupported(true) : 0;
             // SuperRDP2 workflow: 拉取线上最新配置后自动重装
-            // 注意必须走 update（卸载+重装）：菜单选项 1 在已安装时会被安装器早退，
-            // 新 ini 不会拷入 System32、服务不重启，配置不生效
-            if (IsInstalled()) {
-                Log(L"[*] 检测到已安装，自动重新安装以应用新配置…");
-                RunInstaller(L"\n", L"update");
+            // 注意 1：必须走 update（卸载+重装）：菜单选项 1 在已安装时会被安装器早退，
+            //         新 ini 不会拷入 System32、服务不重启，配置不生效
+            // 注意 2：仅当配置确实变化（内容级比较）才重装；配置未变的同步
+            //         不应重启 TermService 而断开正在使用的 RDP 会话
+            if (iniChanged || st == 1) {
+                if (IsInstalled()) {
+                    Log(L"[*] 配置已变化，自动重新安装以应用新配置…");
+                    RunInstaller(L"\n", L"update");
+                } else {
+                    Log(L"[*] 当前未安装，跳过自动重装（点击 安装 即可）");
+                }
             } else {
-                Log(L"[*] 当前未安装，跳过自动重装（点击 安装 即可）");
+                Log(L"[*] 配置无变化，无需重装（避免断开现有 RDP 会话）");
             }
         } else {
             Log(L"[-] 所有配置源均不可用，请检查网络");
         }
         Log(L"===========================");
         break;
+    }
     case ID_BTN_UPDATE:
         Log(L"========= 更新 =========");
         if (DownloadIni((wchar_t*)IniPath().c_str(), true)) {
@@ -1217,14 +1287,6 @@ static void StartAction(int action)
 }
 
 // ---------------- silent mode (boot) ----------------
-static bool GetFileLastWrite(const std::wstring& path, FILETIME& ft)
-{
-    WIN32_FILE_ATTRIBUTE_DATA fi;
-    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fi)) return false;
-    ft = fi.ftLastWriteTime;
-    return true;
-}
-
 static int SilentRun()
 {
     // allocated console for child stdio is not needed; run headless
@@ -1240,9 +1302,7 @@ static int SilentRun()
     if (st == 1 || (downloaded && iniChanged && IsInstalled())) {
         // config extended / replaced -> refresh install quietly (console exe supports "update")
         // We must feed stdin for the trailing pause: use RunInstaller with extraArg.
-        g_silent = true;
         RunInstaller(L"\n", L"update");
-        g_silent = false;
     }
     return 0;
 }
@@ -1315,7 +1375,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             7, 70, 68, 18, hwnd, (HMENU)ID_LBL_STATE, NULL, NULL);
         g_val[2] = CreateWindowW(L"STATIC", L"未安装", WS_CHILD | WS_VISIBLE | SS_LEFT,
             86, 70, 98, 18, hwnd, (HMENU)ID_VAL_STATE, NULL, NULL);
-        CreateWindowW(L"STATIC", L"自动分析：", WS_CHILD | WS_VISIBLE | SS_LEFT,
+        // 标签曾误写为「自动分析：」但该行值是会话数；自动分析开关状态由右侧按钮标题展示
+        CreateWindowW(L"STATIC", L"在线会话：", WS_CHILD | WS_VISIBLE | SS_LEFT,
             7, 98, 86, 18, hwnd, (HMENU)ID_LBL_AUTO, NULL, NULL);
         g_val[3] = CreateWindowW(L"STATIC", L"0/9999", WS_CHILD | WS_VISIBLE | SS_LEFT,
             86, 98, 84, 18, hwnd, (HMENU)ID_VAL_AUTO, NULL, NULL);
@@ -1371,11 +1432,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         SendDlgItemMessageW(hwnd, ID_BTN_AUTOB, WM_SETTEXT, 0,
             (LPARAM)(g_bootAuto ? L"开机启动 ✓" : L"开机启动"));
 
-        // log file for diagnostics (GUI has no on-screen log window, 1:1)
-        // 使用 _snwprintf 带长度限制，防止超长 ExeDir 路径导致 g_szLogFile 溢出
-        _snwprintf(g_szLogFile, MAX_PATH, L"%ls\\SuperRDPGui.log", ExeDir().c_str());
-        g_szLogFile[MAX_PATH - 1] = L'\0';
-        InitLogFile();
+        // log file 初始化已前移到 wWinMain 入口（/silent 开机运行不创建窗口，
+        // 若只在 WM_CREATE 初始化，静默流程将全程无日志）
 
         WSADATA wd;
         if (WSAStartup(MAKEWORD(2, 2), &wd) == 0) { /* keep ws2 alive for status probes */ }
@@ -1399,7 +1457,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_NOTIFY: {
         // SysLink "share to github" click -> open URL
         LPNMHDR hdr = (LPNMHDR)lp;
-        if (hdr->idFrom == ID_GITHUB && hdr->code == NM_CLICK) {
+        // NM_RETURN：键盘焦点下按 Enter 也应打开链接
+        if (hdr->idFrom == ID_GITHUB && (hdr->code == NM_CLICK || hdr->code == NM_RETURN)) {
             ShellExecuteW(NULL, L"open", L"https://github.com/sky12378/SuperRDP2-new", NULL, NULL, SW_SHOW);
         }
         break;
@@ -1445,6 +1504,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show)
 {
+    // 尽早初始化日志：/silent 开机运行不会创建窗口，若 g_szLogFile 只在 WM_CREATE
+    // 设置，静默流程（同步/分析/update）将全程零日志，开机自动支持失败无从排查
+    // 使用 _snwprintf 带长度限制，防止超长 ExeDir 路径导致 g_szLogFile 溢出
+    _snwprintf(g_szLogFile, MAX_PATH, L"%ls\\SuperRDPGui.log", ExeDir().c_str());
+    g_szLogFile[MAX_PATH - 1] = L'\0';
+    InitLogFile();
+
 #ifdef SRDP_TEST
     (void)hInst; (void)hPrev; (void)cmd; (void)show;
     return AnalyzeTestMode();

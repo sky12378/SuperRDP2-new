@@ -228,12 +228,14 @@ BOOL __stdcall GetFileVersion(LPCWSTR lptstrFilename, FILE_VERSION* FileVersion)
     HRSRC hResourceInfo = FindResourceW(hFile, (LPCWSTR)1, (LPCWSTR)0x10);
     if (!hResourceInfo)
     {
+        FreeLibrary(hFile);
         return false;
     }
 
     VS_VERSIONINFO* VersionInfo = (VS_VERSIONINFO*)LoadResource(hFile, hResourceInfo);
     if (!VersionInfo)
     {
+        FreeLibrary(hFile);
         return false;
     }
 
@@ -241,6 +243,8 @@ BOOL __stdcall GetFileVersion(LPCWSTR lptstrFilename, FILE_VERSION* FileVersion)
     FileVersion->Release = (WORD)(VersionInfo->Value.dwFileVersionLS >> 16);
     FileVersion->Build = (WORD)VersionInfo->Value.dwFileVersionLS;
 
+    // 版本数据已拷贝到出参，映射不再需要，成功路径也要释放
+    FreeLibrary(hFile);
     return true;
 }
 
@@ -447,6 +451,8 @@ bool SvcStart(wchar_t* SvcName)
         }
         else {
             printf("[*] Start service faild.%d\n", err);
+            // 原实现落空到 ret = true，把启动失败误报为成功，必须走失败路径
+            goto __exit;
         }
     }
 
@@ -563,7 +569,12 @@ void CheckTermsrvProcess()
     int i = 0;
     bool Started = false;
     bool again = false;
+    int retry = 0;
 __again:
+    // 重试时声明在标签前的变量不会重新初始化，必须手动复位，
+    // 否则上一轮的 found/again 残留会导致错误分支被跳过或重复循环
+    found = false;
+    again = false;
 
     hSc = OpenSCManager(NULL, SERVICES_ACTIVE_DATABASE, SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
     if (hSc == NULL) {
@@ -629,6 +640,13 @@ __again:
             if (Started) {
                 printf("Failed to set up TermService. Unknown error.\n");
                 getchar();
+                again = false;
+                goto __exit;
+            }
+            // 原实现无重试上限：SvcStart 失败时 Started 保持 false，
+            // again=true 反复跳回 __again，构成无限循环
+            if (++retry > 3) {
+                printf("[-] Failed to start TermService after %d retries.\n", retry - 1);
                 again = false;
                 goto __exit;
             }

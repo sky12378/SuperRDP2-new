@@ -136,6 +136,13 @@ HRESULT __fastcall New_Win8SL_CP(DWORD arg1, DWORD *pdwValue, PWSTR pwszValueNam
 }
 #endif
 
+// 偏移为 0（ini 变量缺失时的默认值）时返回 NULL：
+// 否则指针会落在模块基址上，后续写入将破坏 termsrv.dll 的 PE 头
+static DWORD* OffsetPtr(PLATFORM_DWORD Base, PLATFORM_DWORD Offset)
+{
+	return Offset ? (DWORD*)(Base + Offset) : NULL;
+}
+
 HRESULT WINAPI New_CSLQuery_Initialize()
 {
 	/*extern PLATFORM_DWORD TermSrvBase;
@@ -161,23 +168,23 @@ HRESULT WINAPI New_CSLQuery_Initialize()
 	if (IniFile->SectionExists(Sect))
 	{
 		#ifdef _WIN64
-		bServerSku = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "bServerSku.x64", 0));
-		bRemoteConnAllowed = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "bRemoteConnAllowed.x64", 0));
-		bFUSEnabled = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "bFUSEnabled.x64", 0));
-		bAppServerAllowed = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "bAppServerAllowed.x64", 0));
-		bMultimonAllowed = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "bMultimonAllowed.x64", 0));
-		lMaxUserSessions = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "lMaxUserSessions.x64", 0));
-		ulMaxDebugSessions = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "ulMaxDebugSessions.x64", 0));
-		bInitialized = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "bInitialized.x64", 0));
+		bServerSku = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "bServerSku.x64", 0));
+		bRemoteConnAllowed = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "bRemoteConnAllowed.x64", 0));
+		bFUSEnabled = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "bFUSEnabled.x64", 0));
+		bAppServerAllowed = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "bAppServerAllowed.x64", 0));
+		bMultimonAllowed = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "bMultimonAllowed.x64", 0));
+		lMaxUserSessions = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "lMaxUserSessions.x64", 0));
+		ulMaxDebugSessions = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "ulMaxDebugSessions.x64", 0));
+		bInitialized = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "bInitialized.x64", 0));
 		#else
-		bServerSku = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "bServerSku.x86", 0));
-		bRemoteConnAllowed = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "bRemoteConnAllowed.x86", 0));
-		bFUSEnabled = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "bFUSEnabled.x86", 0));
-		bAppServerAllowed = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "bAppServerAllowed.x86", 0));
-		bMultimonAllowed = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "bMultimonAllowed.x86", 0));
-		lMaxUserSessions = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "lMaxUserSessions.x86", 0));
-		ulMaxDebugSessions = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "ulMaxDebugSessions.x86", 0));
-		bInitialized = (DWORD*)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "bInitialized.x86", 0));
+		bServerSku = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "bServerSku.x86", 0));
+		bRemoteConnAllowed = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "bRemoteConnAllowed.x86", 0));
+		bFUSEnabled = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "bFUSEnabled.x86", 0));
+		bAppServerAllowed = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "bAppServerAllowed.x86", 0));
+		bMultimonAllowed = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "bMultimonAllowed.x86", 0));
+		lMaxUserSessions = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "lMaxUserSessions.x86", 0));
+		ulMaxDebugSessions = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "ulMaxDebugSessions.x86", 0));
+		bInitialized = OffsetPtr(TermSrvBase, INIReadDWordHex(IniFile, Sect, "bInitialized.x86", 0));
 		#endif
 	}
 	delete[] Sect;
