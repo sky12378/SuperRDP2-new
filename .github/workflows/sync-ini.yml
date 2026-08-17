@@ -1,0 +1,54 @@
+name: Sync upstream rdpwrap.ini
+
+# 自动同步 bin/x64/rdpwrap.ini 与上游 sebaxakerhtc/rdpwrap.ini (master)
+# 触发：每天 08:00 北京时间（00:00 UTC）+ 手动 workflow_dispatch
+
+on:
+  schedule:
+    - cron: '0 0 * * *'   # 每天 00:00 UTC = 08:00 北京
+  workflow_dispatch:       # 支持手动触发
+
+permissions:
+  contents: write          # 允许推回 main
+
+concurrency:
+  group: sync-ini
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download upstream rdpwrap.ini
+        run: |
+          set -e
+          mkdir -p bin/x64
+          # 上游 master 分支的 rdpwrap.ini
+          curl -fsSL https://raw.githubusercontent.com/sebaxakerhtc/rdpwrap.ini/master/rdpwrap.ini -o bin/x64/rdpwrap.ini
+          # 显示版本概览（首行 + 节数）
+          echo "::group::Upstream ini preview"
+          head -n 5 bin/x64/rdpwrap.ini
+          echo "sections: $(grep -c '^\[' bin/x64/rdpwrap.ini)"
+          echo "::endgroup::"
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bin/x64/rdpwrap.ini
+          if git diff --cached --quiet; then
+            echo "No changes, upstream already in sync."
+          else
+            git commit -m "chore(ini): sync rdpwrap.ini from upstream sebaxakerhtc/master
+
+            Auto-sync by GitHub Actions.
+            Source: https://github.com/sebaxakerhtc/rdpwrap.ini/blob/master/rdpwrap.ini"
+            git push
+            echo "::notice::Pushed upstream update"
+          fi
