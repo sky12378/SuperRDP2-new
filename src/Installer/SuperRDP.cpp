@@ -1093,7 +1093,7 @@ int wmain(int argc, wchar_t* argv[])
         PathRemoveFileSpecW(rdpwrap);
         PathAppendW(rdpwrap, L"rdpwrap.dll");
         if (!PathFileExistsW(rdpwrap)) {
-            printf("[-] Can't found rdpwrap.dll, please download the file from https://github.com/anhkgg/SuperRDP\n");
+            printf("[-] Can't found rdpwrap.dll, please download the file from https://github.com/sky12378/SuperRDP2-new\n");
             goto __exit;
         }
 
@@ -1122,7 +1122,7 @@ int wmain(int argc, wchar_t* argv[])
         PathRemoveFileSpecW(rdpwrap);
         PathAppendW(rdpwrap, L"rdpwrap.dll");
         if (!PathFileExistsW(rdpwrap)) {
-            printf("[-] Can't found rdpwrap.dll, please download the file from https://github.com/anhkgg/SuperRDP\n");
+            printf("[-] Can't found rdpwrap.dll, please download the file from https://github.com/sky12378/SuperRDP2-new\n");
             goto __exit;
         }
 

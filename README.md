@@ -2,6 +2,9 @@
 
 解锁 Windows Home / 非 Pro 版本被阉割的**远程桌面（RDP）**功能 —— 基于 [anhkgg/SuperRDP](https://github.com/anhkgg/SuperRDP) 的重建工程，2026-08 维护版。
 
+> 项目地址：https://github.com/sky12378/SuperRDP2-new
+> 问题反馈：https://github.com/sky12378/SuperRDP2-new/issues
+
 - 纯 C/C++ 源码（Win32 API 原生界面，无框架依赖），MinGW-w64 一键构建
 - **仅 x64**（32 位已于 2026-08 停止维护）
 - 配置库覆盖 Windows XP ~ Windows 11 25H2 Insider（`termsrv.dll` 最高 10.0.29565.1000）
@@ -37,8 +40,6 @@
 | **+** | 强制重启 TermService 服务（改配置后点此生效） |
 | **自动分析** | 开关（默认开启，带 `✓`）。开启后，安装/同步/更新时若发现当前 `termsrv.dll` 版本不在配置库中，自动扫描 DLL 定位 4 个关键补丁偏移（DefPolicy / SingleUser / LocalOnly / SLInit）并追加配置段。详见下文 |
 | **开机启动** | 开关（带 `✓`）。开启后写入 `HKLM\...\Run`，开机登录后静默执行：下载最新配置 → 自动分析 → 需要时自动重装（无窗口、无交互） |
-| **关于** | 弹出版本信息 |
-| **送杯咖啡** | 打开赞助链接 |
 | **share to github** | 打开项目主页 |
 
 #### 左侧信息面板（每 15 秒自动刷新）

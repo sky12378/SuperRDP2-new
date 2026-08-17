@@ -48,8 +48,7 @@
 #define ID_BTN_STOPSVc    1004
 #define ID_BTN_SYNC       1005
 #define ID_BTN_UPDATE     1006
-#define ID_BTN_ABOUT      1007
-#define ID_BTN_COFFEE     1008
+
 #define ID_BTN_AUTOA      1010   // 自动分析 toggle
 #define ID_BTN_AUTOB      1011   // 开机启动 toggle
 #define ID_PANEL          1012   // big background container (overlaps children)
@@ -1203,14 +1202,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         // ---- right margin buttons (outside the panel) ----
         CreateWindowW(L"BUTTON", L"更新", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             341, 7, 109, 33, hwnd, (HMENU)ID_BTN_UPDATE, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"关于", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            341, 47, 109, 33, hwnd, (HMENU)ID_BTN_ABOUT, NULL, NULL);
         CreateWindowW(L"BUTTON", L"自动分析", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             343, 88, 107, 18, hwnd, (HMENU)ID_BTN_AUTOA, NULL, NULL);
         CreateWindowW(L"BUTTON", L"开机启动", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
             343, 110, 107, 18, hwnd, (HMENU)ID_BTN_AUTOB, NULL, NULL);
-        CreateWindowW(L"BUTTON", L"送杯咖啡", WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-            341, 133, 109, 33, hwnd, (HMENU)ID_BTN_COFFEE, NULL, NULL);
 
         // ---- bottom status line (1:1: "server is wrong." placeholder) ----
         g_hStatus = CreateWindowW(L"STATIC", L"server is wrong.", WS_CHILD | WS_VISIBLE | SS_LEFT,
@@ -1260,7 +1255,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         // SysLink "share to github" click -> open URL
         LPNMHDR hdr = (LPNMHDR)lp;
         if (hdr->idFrom == ID_GITHUB && hdr->code == NM_CLICK) {
-            ShellExecuteW(NULL, L"open", L"https://github.com/anhkgg/SuperRDP", NULL, NULL, SW_SHOW);
+            ShellExecuteW(NULL, L"open", L"https://github.com/sky12378/SuperRDP2-new", NULL, NULL, SW_SHOW);
         }
         break;
     }
@@ -1288,20 +1283,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 SetBoot(g_bootAuto);
                 KickStatusRefresh();
             }
-            return 0;
-        case ID_BTN_ABOUT:
-            if (HIWORD(wp) == BN_CLICKED)
-                MessageBoxW(hwnd,
-                    L"SuperRDP2 (1:1 replica)\r\n\r\n"
-                    L"基于 anhkgg/SuperRDP 控制台安装器重建的纯 Win32 GUI。\r\n"
-                    L"功能：安装/卸载、同步最新 rdpwrap.ini、自动分析补丁点、\r\n"
-                    L"启动/停止终端服务、开机自动支持。\r\n\r\n"
-                    L"开源：https://github.com/anhkgg/SuperRDP",
-                    L"关于 SuperRDP2", MB_OK | MB_ICONINFORMATION);
-            return 0;
-        case ID_BTN_COFFEE:
-            if (HIWORD(wp) == BN_CLICKED)
-                ShellExecuteW(NULL, L"open", L"https://github.com/sponsors/anhkgg", NULL, NULL, SW_SHOW);
             return 0;
         case ID_BTN_PLUS:
             if (HIWORD(wp) == BN_CLICKED)
@@ -1354,7 +1335,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show)
 
     Log(L"SuperRDP GUI 已启动（管理员）");
     Log(L"建议流程：[同步最新配置] → 勾选[自动分析] → [安装 SuperRDP]");
-    Log(L"若仍不支持，请到 https://github.com/anhkgg/SuperRDP/issues 提交 termsrv.dll");
+    Log(L"若仍不支持，请到 https://github.com/sky12378/SuperRDP2-new/issues 提交 termsrv.dll");
 
     MSG m;
     while (GetMessageW(&m, NULL, 0, 0)) {
