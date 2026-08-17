@@ -1,0 +1,12 @@
+# Build / runtime artifacts (not source)
+*.log
+*.bak
+*.autobak
+
+# WorkBuddy internal memory / agent state (not project source)
+.workbuddy/
+
+# OS junk
+Thumbs.db
+ehthumbs.db
+Desktop.ini
