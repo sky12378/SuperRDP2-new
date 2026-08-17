@@ -323,7 +323,7 @@ static bool AnalyzeTermsrv(AnalyzeResult& r)
 {
     memset(&r, 0, sizeof(r));
     wchar_t sys[MAX_PATH] = {0}, dll[MAX_PATH] = {0};
-    GetSystemDirectoryW(sys, MAX_PATH);
+    if (!GetSystemDirectoryW(sys, MAX_PATH)) return false;   // G6: 失败时避免对未初始化缓冲操作
     wcscpy(dll, sys); PathAppendW(dll, L"termsrv.dll");
 
     if (!GetTermsrvVersion(dll, r.ver, 64)) return false;
@@ -396,7 +396,7 @@ static bool IniHasSection(const wchar_t* ini, const wchar_t* ver)
             if (c == '\n') {
                 if (checkLine(line)) { found = true; break; }
                 line.clear();
-            } else line += c;
+            } else if (line.size() < 4096) line += c;   // G9: 行长度上限，损坏文件的无界长行丢弃
         }
         if (found) break;
     }
@@ -443,6 +443,46 @@ static const wchar_t* kIniUrls[] = {
     L"https://raw.githubusercontent.com/stascorp/rdpwrap/master/res/rdpwrap.ini",
 };
 
+// G2: 下载截止时间看门狗。URLDownloadToFileW 无超时参数，代理挂起会永久阻塞
+// worker 线程（g_bBusy 一直为 1 → 所有按钮永久禁用）。通过 IBindStatusCallback::
+// OnProgress 在截止时刻返回 E_ABORT 中止传输；连接完全停滞的场景仍由 WinINet
+// 内部默认超时兑底，但慢速滴漏与已建连的挂起都能被看门狗切断。
+static const DWORD kDownloadTimeoutMs = 20000;   // 单次下载尝试的截止时间
+// IID 本地定义，避免依赖 -luuid 是否提供符号
+static const IID kIID_IUnknown_L = { 0x00000000, 0x0000, 0x0000, { 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46 } };
+static const IID kIID_IBindStatusCallback_L = { 0x79EAC9C2, 0xBAF9, 0x11CE, { 0x8C, 0x82, 0x00, 0xAA, 0x00, 0x4B, 0xA9, 0x0B } };
+
+struct DeadlineBSC : public IBindStatusCallback {
+    LONG refs;
+    DWORD deadlineTick;
+    explicit DeadlineBSC(DWORD timeoutMs) : refs(1) { deadlineTick = GetTickCount() + timeoutMs; }
+    // IUnknown
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
+        if (!ppv) return E_POINTER;
+        if (riid == kIID_IUnknown_L || riid == kIID_IBindStatusCallback_L) { *ppv = this; AddRef(); return S_OK; }
+        *ppv = NULL;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() { return (ULONG)InterlockedIncrement(&refs); }
+    STDMETHODIMP_(ULONG) Release() {
+        LONG r = InterlockedDecrement(&refs);
+        if (r == 0) delete this;
+        return (ULONG)r;
+    }
+    // IBindStatusCallback：仅 OnProgress 的截止判定有意义，其余空实现
+    STDMETHODIMP OnStartBinding(DWORD, IBinding*) { return S_OK; }
+    STDMETHODIMP GetPriority(LONG* p) { if (p) *p = 0; return S_OK; }
+    STDMETHODIMP OnLowResource(DWORD) { return S_OK; }
+    STDMETHODIMP OnProgress(ULONG, ULONG, ULONG, LPCWSTR) {
+        // GetTickCount 减法强转 LONG，49.7 天溢出回绕时比较仍正确
+        return ((LONG)(GetTickCount() - deadlineTick) >= 0) ? E_ABORT : S_OK;
+    }
+    STDMETHODIMP OnStopBinding(HRESULT, LPCWSTR) { return S_OK; }
+    STDMETHODIMP GetBindInfo(DWORD* grfBINDF, BINDINFO*) { if (grfBINDF) *grfBINDF = 0; return S_OK; }
+    STDMETHODIMP OnDataAvailable(DWORD, DWORD, FORMATETC*, STGMEDIUM*) { return S_OK; }
+    STDMETHODIMP OnObjectAvailable(REFIID, IUnknown*) { return S_OK; }
+};
+
 // changed（可选）：输出"内容是否真的变化"。LastWriteTime 不可靠——
 // URLDownloadToFileW 的时间戳取决于代理是否透传 Last-Modified，
 // 代理剥离该头时会误判为变化，导致开机静默模式每次启动都卸载+重装
@@ -456,15 +496,20 @@ static bool DownloadIni(const wchar_t* dest, bool verbose, bool* changed = NULL)
         // 1) 先尝试代理
         wchar_t proxyUrl[512];
         _snwprintf(proxyUrl, 512, L"%ls%ls", kProxyPrefix, url);
+        proxyUrl[511] = 0;   // G5: _snwprintf 截断时不补终止符，同文件其余调用都有兑底
         DeleteFileW(tmp);
         if (verbose) Log(L"[*] downloading via proxy: %ls", proxyUrl);
-        HRESULT hr = URLDownloadToFileW(NULL, proxyUrl, tmp, 0, NULL);
+        DeadlineBSC* cb = new DeadlineBSC(kDownloadTimeoutMs);
+        HRESULT hr = URLDownloadToFileW(NULL, proxyUrl, tmp, 0, cb);
+        cb->Release();
         if (FAILED(hr)) {
             // 2) 代理失败，回退直连
             if (verbose) Log(L"[-] proxy failed (hr=0x%08X), trying direct: %ls", hr, url);
             DeleteFileW(tmp);
             if (verbose) Log(L"[*] downloading: %ls", url);
-            hr = URLDownloadToFileW(NULL, url, tmp, 0, NULL);
+            cb = new DeadlineBSC(kDownloadTimeoutMs);
+            hr = URLDownloadToFileW(NULL, url, tmp, 0, cb);
+            cb->Release();
         }
         if (FAILED(hr)) { if (verbose) Log(L"[-] download failed (hr=0x%08X), trying next source", hr); continue; }
         // validate: size + section markers（扫描全文件；[PatchCodes] 位于文件末尾，前 8192 字节找不到会永远失败）
@@ -629,8 +674,14 @@ static int RunInstaller(const wchar_t* option, const wchar_t* extraArg = NULL)
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE outR = NULL, outW = NULL, inR = NULL, inW = NULL;
-    CreatePipe(&outR, &outW, &sa, 0);
-    CreatePipe(&inR, &inW, &sa, 0);
+    if (!CreatePipe(&outR, &outW, &sa, 0) || !CreatePipe(&inR, &inW, &sa, 0)) {
+        Log(L"[-] CreatePipe failed: %u", GetLastError());
+        if (outR) CloseHandle(outR);
+        if (outW) CloseHandle(outW);
+        if (inR) CloseHandle(inR);
+        if (inW) CloseHandle(inW);
+        return -1;
+    }
     SetHandleInformation(outR, HANDLE_FLAG_INHERIT, 0);
     SetHandleInformation(inW, HANDLE_FLAG_INHERIT, 0);
 
@@ -698,17 +749,22 @@ static int RunInstaller(const wchar_t* option, const wchar_t* extraArg = NULL)
         TerminateProcess(pi.hProcess, 0);
         WaitForSingleObject(pi.hProcess, 3000);
     }
-    // 非阻塞排空（Peek + 截止时间）：进程已退出，写端关闭后自然 EOF
+    // 非阻塞排空（Peek + 截止时间）：进程已退出，写端关闭后自然 EOF。
+    // G3: 管道连续 300ms 为空即退出（写端已真正关闭）；3s 硬上限防孙进程占写端不输出的极端情形
     DWORD drainStart = GetTickCount();
+    DWORD lastData = drainStart;
     for (;;) {
         DWORD avail = 0;
         if (!PeekNamedPipe(outR, NULL, 0, NULL, &avail, NULL)) break;  // pipe closed
         if (avail > 0) {
             if (!ReadFile(outR, rbuf, sizeof(rbuf), &rd, NULL) || rd == 0) break;
             AppendToLogMB(rbuf, rd);
+            lastData = GetTickCount();
             continue;
         }
-        if (GetTickCount() - drainStart >= 1000) break;
+        DWORD now = GetTickCount();
+        if (now - lastData >= 300) break;      // 管道连续为空，排空完成
+        if (now - drainStart >= 3000) break;   // 硬上限
         Sleep(50);
     }
     AppendToLogMB(NULL, 0);   // 冲刷解码器中可能残留的半截多字节字符
@@ -774,7 +830,7 @@ static bool CopySiblingSLInit(const wchar_t* ini, const wchar_t* ver, std::strin
                     body.push_back(line);
                 }
                 line.clear();
-            } else line += c;
+            } else if (line.size() < 4096) line += c;   // G9: 行长度上限
         }
     }
     CloseHandle(f);
@@ -800,6 +856,22 @@ static void BackupIni(const wchar_t* ini)
     CopyFileW(ini, bak, FALSE);  // best-effort
 }
 
+// 尝试克隆同系列 -SLInit 数据段并追加到 ini（G10：生成与修复路径共用）
+static bool AppendSLInitClone(const wchar_t* ini, const wchar_t* ver, bool verbose)
+{
+    std::string slinit;
+    if (!CopySiblingSLInit(ini, ver, slinit)) {
+        if (verbose) Log(L"[!] 未找到同系列 -SLInit 数据段（策略数据将使用默认值）");
+        return false;
+    }
+    HANDLE f2 = CreateFileW(ini, FILE_APPEND_DATA, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f2 == INVALID_HANDLE_VALUE) return false;
+    DWORD wr; WriteFile(f2, slinit.c_str(), (DWORD)slinit.size(), &wr, NULL);
+    CloseHandle(f2);
+    if (verbose) Log(L"[+] 已从同系列 build 克隆 [%ls-SLInit] 数据段", ver);
+    return true;
+}
+
 // ---------------- AutoSupport wrapper ----------------
 // returns: 0 = already supported / 1 = generated / -1 = failed
 static int EnsureSupported(bool verbose)
@@ -815,6 +887,11 @@ static int EnsureSupported(bool verbose)
         return -1;
     }
     if (IniHasSection(ini.c_str(), r.ver)) {
+        // G10 修复：补丁段存在但同系列 -SLInit 数据段缺失（上次写入中途崩溃等），
+        // 仅补克隆该段，避免策略数据永远走默认值
+        wchar_t slVer[96];
+        _snwprintf(slVer, 96, L"%ls-SLInit", r.ver); slVer[95] = 0;
+        if (!IniHasSection(ini.c_str(), slVer)) AppendSLInitClone(ini.c_str(), r.ver, verbose);
         if (verbose) Log(L"[+] termsrv %ls 已被配置支持", r.ver);
         return 0;
     }
@@ -828,17 +905,7 @@ static int EnsureSupported(bool verbose)
         return -1;
     }
     if (verbose) Log(L"[+] 已自动生成 [%ls] 支持段并写入 rdpwrap.ini", r.ver);
-    std::string slinit;
-    if (CopySiblingSLInit(ini.c_str(), r.ver, slinit)) {
-        HANDLE f2 = CreateFileW(ini.c_str(), FILE_APPEND_DATA, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (f2 != INVALID_HANDLE_VALUE) {
-            DWORD wr; WriteFile(f2, slinit.c_str(), (DWORD)slinit.size(), &wr, NULL);
-            CloseHandle(f2);
-            if (verbose) Log(L"[+] 已从同系列 build 克隆 [%ls-SLInit] 数据段", r.ver);
-        }
-    } else if (verbose) {
-        Log(L"[!] 未找到同系列 -SLInit 数据段（策略数据将使用默认值）");
-    }
+    AppendSLInitClone(ini.c_str(), r.ver, verbose);
     return 1;
 }
 
@@ -957,6 +1024,7 @@ static bool IsInstalled()
     wchar_t v[MAX_PATH] = {0}; DWORD sz = sizeof(v); DWORD t;
     bool on = false;
     if (RegQueryValueExW(k, L"ServiceDll", 0, &t, (LPBYTE)v, &sz) == ERROR_SUCCESS) {
+        v[MAX_PATH - 1] = 0;   // G4: 恰好填满时无终止符，强制收尾防 wcsrchr 越界扫描
         wchar_t* name = wcsrchr(v, L'\\');
         on = (name && !_wcsicmp(name + 1, L"rdpwrap.dll"));
     }
@@ -985,14 +1053,15 @@ static void QueryStatus(StatusInfo& s)
     s.installed = IsInstalled();
     QueryOSVersion(s.osver, 64);
 
-    wchar_t sys[MAX_PATH], dll[MAX_PATH];
-    GetSystemDirectoryW(sys, MAX_PATH);
-    wcscpy(dll, sys); PathAppendW(dll, L"termsrv.dll");
-    if (GetTermsrvVersion(dll, s.termsrv, 64)) {
-        std::wstring ini = IniPath();
-        if (PathFileExistsW(ini.c_str())) {
-            s.supported = IniHasSection(ini.c_str(), s.termsrv);
-            LatestIniVersion(ini.c_str(), s.latest, 64);
+    wchar_t sys[MAX_PATH] = {0}, dll[MAX_PATH] = {0};
+    if (GetSystemDirectoryW(sys, MAX_PATH)) {   // G6: 失败时跳过 termsrv 版本/支持性检查
+        wcscpy(dll, sys); PathAppendW(dll, L"termsrv.dll");
+        if (GetTermsrvVersion(dll, s.termsrv, 64)) {
+            std::wstring ini = IniPath();
+            if (PathFileExistsW(ini.c_str())) {
+                s.supported = IniHasSection(ini.c_str(), s.termsrv);
+                LatestIniVersion(ini.c_str(), s.latest, 64);
+            }
         }
     }
 
@@ -1122,9 +1191,10 @@ static void KickStatusRefresh()
 static void DoStatus()
 {
     Log(L"========= 状态检查 =========");
-    wchar_t sys[MAX_PATH], dll[MAX_PATH];
-    GetSystemDirectoryW(sys, MAX_PATH);
-    wcscpy(dll, sys); PathAppendW(dll, L"termsrv.dll");
+    wchar_t sys[MAX_PATH] = {0}, dll[MAX_PATH] = {0};
+    if (GetSystemDirectoryW(sys, MAX_PATH)) {   // G6: 失败时 dll 保持空路径，后续检查报缺失
+        wcscpy(dll, sys); PathAppendW(dll, L"termsrv.dll");
+    }
     wchar_t ver[64] = L"?";
     GetTermsrvVersion(dll, ver, 64);
     Log(L"termsrv.dll: %ls  (%s)", ver, PathFileExistsW(dll) ? L"存在" : L"缺失");
@@ -1139,8 +1209,10 @@ static void DoStatus()
     HKEY k;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\TermService\\Parameters", 0, KEY_READ, &k) == ERROR_SUCCESS) {
         wchar_t v[MAX_PATH] = {0}; DWORD sz = sizeof(v); DWORD t;
-        if (RegQueryValueExW(k, L"ServiceDll", 0, &t, (LPBYTE)v, &sz) == ERROR_SUCCESS)
+        if (RegQueryValueExW(k, L"ServiceDll", 0, &t, (LPBYTE)v, &sz) == ERROR_SUCCESS) {
+            v[MAX_PATH - 1] = 0;   // G4: 强制收尾
             Log(L"TermService ServiceDll: %ls", v);
+        }
         RegCloseKey(k);
     }
     Log(L"开机自动支持: %s", BootEnabled() ? L"已开启" : L"未开启");
@@ -1179,6 +1251,13 @@ static bool ControlTermService(bool start)
 // ---------------- actions (worker thread) ----------------
 struct WorkerParam { int action; };
 
+// G11: 安装器退出码汇总日志（控制台侧失败时已返回退出码 1）
+static void ReportInstallerResult(int ret, const wchar_t* what)
+{
+    if (ret == -1) return;   // 创建失败，RunInstaller 内部已打印具体错误
+    if (ret != 0) Log(L"[-] %ls：安装器报告失败（退出码 %d），详见上方日志", what, ret);
+}
+
 static DWORD WINAPI Worker(LPVOID p)
 {
     int action = ((WorkerParam*)p)->action;
@@ -1195,20 +1274,20 @@ static DWORD WINAPI Worker(LPVOID p)
         // 要让安装按钮在已安装状态下也能重新应用配置/dll，必须走 update 路径
         if (IsInstalled()) {
             Log(L"[*] 检测到已安装，走 update 路径重新安装…");
-            RunInstaller(L"\n", L"update");
+            ReportInstallerResult(RunInstaller(L"\n", L"update"), L"安装");
         } else {
-            RunInstaller(L"1");
+            ReportInstallerResult(RunInstaller(L"1"), L"安装");
         }
         Log(L"========= 安装流程结束 =========");
         break;
     case ID_BTN_UNINSTALL:
         Log(L"========= 开始卸载 =========");
-        RunInstaller(L"2");
+        ReportInstallerResult(RunInstaller(L"2"), L"卸载");
         Log(L"========= 卸载流程结束 =========");
         break;
     case ID_BTN_RESTART:
         Log(L"========= 强制重启终端服务 =========");
-        RunInstaller(L"3");
+        ReportInstallerResult(RunInstaller(L"3"), L"强制重启");
         Log(L"========= 重启完成 =========");
         break;
     case ID_BTN_SYNC: {
@@ -1224,7 +1303,7 @@ static DWORD WINAPI Worker(LPVOID p)
             if (iniChanged || st == 1) {
                 if (IsInstalled()) {
                     Log(L"[*] 配置已变化，自动重新安装以应用新配置…");
-                    RunInstaller(L"\n", L"update");
+                    ReportInstallerResult(RunInstaller(L"\n", L"update"), L"同步后自动重装");
                 } else {
                     Log(L"[*] 当前未安装，跳过自动重装（点击 安装 即可）");
                 }
@@ -1242,7 +1321,7 @@ static DWORD WINAPI Worker(LPVOID p)
         if (DownloadIni((wchar_t*)IniPath().c_str(), true)) {
             if (g_autoSupport) EnsureSupported(true);
             Log(L"[*] 重新应用配置（卸载+重新安装）…");
-            RunInstaller(L"\n", L"update");
+            ReportInstallerResult(RunInstaller(L"\n", L"update"), L"更新");
         } else {
             Log(L"[-] 所有配置源均不可用，请检查网络");
         }
@@ -1436,7 +1515,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         // 若只在 WM_CREATE 初始化，静默流程将全程无日志）
 
         WSADATA wd;
-        if (WSAStartup(MAKEWORD(2, 2), &wd) == 0) { /* keep ws2 alive for status probes */ }
+        if (WSAStartup(MAKEWORD(2, 2), &wd) != 0) {
+            // G8: 失败时 3389 监听探测恒为「未监听」，记日志提示避免状态行误导
+            Log(L"[!] WSAStartup 失败（%d），3389 监听探测不可用", WSAGetLastError());
+        }
         SetTimer(hwnd, TIMER_FIRST_STATUS, 400, NULL);   // first refresh shortly after show
         SetTimer(hwnd, TIMER_STATUS, 15000, NULL);       // real-time refresh every 15s
         return 0;
@@ -1495,11 +1577,36 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         break;
+    case WM_CLOSE:
+        // G1: 忙碌期关闭窗口会强杀 worker 线程，可能把安装斩断在
+        // "ServiceDll 已切换、服务未重启"的半安装态，拒绝关闭
+        if (InterlockedCompareExchange(&g_bBusy, 0, 0)) {
+            Log(L"[!] 操作进行中，请等待完成后再关闭窗口");
+            return 0;
+        }
+        DestroyWindow(hwnd);
+        return 0;
     case WM_DESTROY:
+        if (g_hFont) { DeleteObject(g_hFont); g_hFont = NULL; }   // G8: 释放 GDI 字体（子控件已先行销毁）
         PostQuitMessage(0);
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+// G7: 实测提升状态；日志措辞不得无条件声称管理员（manifest 被剥离等非提权运行场景）
+static bool IsElevatedAdmin()
+{
+    bool elevated = false;
+    HANDLE token = NULL;
+    if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        TOKEN_ELEVATION te = {0};
+        DWORD len = 0;
+        if (GetTokenInformation(token, TokenElevation, &te, sizeof(te), &len))
+            elevated = (te.TokenIsElevated != 0);   // MinGW 头文件成员名为 TokenIsElevated（MSVC 为 dwTokenIsElevated）
+        CloseHandle(token);
+    }
+    return elevated;
 }
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show)
@@ -1545,7 +1652,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int show)
     ShowWindow(g_hWnd, show ? show : SW_SHOW);
     UpdateWindow(g_hWnd);
 
-    Log(L"SuperRDP GUI 已启动（管理员）");
+    if (IsElevatedAdmin()) {
+        Log(L"SuperRDP GUI 已启动（管理员）");
+    } else {
+        Log(L"[!] SuperRDP GUI 已启动（非管理员：写注册表/服务操作可能失败，请右键以管理员身份运行）");
+    }
     Log(L"建议流程：[同步最新配置] → 勾选[自动分析] → [安装 SuperRDP]");
     Log(L"若仍不支持，请到 https://github.com/sky12378/SuperRDP2-new/issues 提交 termsrv.dll");
 

@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <iostream>
 #include <windows.h>
+#include <stddef.h>
 #include <strsafe.h>
 #include <shlwapi.h>
 #pragma comment(lib, "shlwapi")
@@ -16,23 +17,18 @@
 #include <new>
 
 INI_FILE* IniFile = NULL;
-wchar_t LogFile[MAX_PATH] = { 0 };
 
 
 //int SC_ENUM_PROCESS_INFO = 0;
 wchar_t TermService[] = L"TermService";
 bool Installed = false;
-wchar_t WrapPath[MAX_PATH] = { 0 };
-char IniPath[] = { 0 };
 int Arch = 0;
 PVOID OldWow64RedirectionValue = NULL;
 std::wstring TermServicePath;
 //FILE_VERSION FV = { 0 }; //
 DWORD TermServicePID = 0;
-wchar_t TermServiceName[MAX_PATH] = { 0 };
 wchar_t ShareSvc[100][MAX_PATH] = { 0 };
 int ShareSvcCount = 0;
-char sShareSvc[1];
 
 bool SupportedArchitecture()
 {
@@ -119,7 +115,7 @@ bool CheckInstall()
         printf("[*] ImagePath: %ws\n", TermServicePath.c_str());
     }
 
-    Installed = (TermServicePath.find(L"rdpwrap.dll") != std::string::npos);
+    Installed = (TermServicePath.find(L"rdpwrap.dll") != std::wstring::npos);
 
     //Installed = (TermServicePath.find(L"\\system32\\termsrv.dll") != std::string::npos);
     // printf("[*] ServiceDll: %ws\n", TermServicePath.c_str());
@@ -232,8 +228,17 @@ BOOL __stdcall GetFileVersion(LPCWSTR lptstrFilename, FILE_VERSION* FileVersion)
         return false;
     }
 
-    VS_VERSIONINFO* VersionInfo = (VS_VERSIONINFO*)LoadResource(hFile, hResourceInfo);
-    if (!VersionInfo)
+    HGLOBAL hResData = LoadResource(hFile, hResourceInfo);
+    if (!hResData)
+    {
+        FreeLibrary(hFile);
+        return false;
+    }
+
+    // 用 LockResource 取真实数据指针，并校验资源尺寸，避免截断/损坏的版本资源导致越界读
+    VS_VERSIONINFO* VersionInfo = (VS_VERSIONINFO*)LockResource(hResData);
+    if (!VersionInfo ||
+        SizeofResource(hFile, hResourceInfo) < offsetof(VS_VERSIONINFO, Value) + sizeof(VS_FIXEDFILEINFO))
     {
         FreeLibrary(hFile);
         return false;
@@ -267,7 +272,10 @@ bool CheckTermsrvVersion(wchar_t *IniPath)
     }
 
 
-    GetSystemDirectoryW(termsrv, MAX_PATH);
+    if (!GetSystemDirectoryW(termsrv, MAX_PATH)) {
+        printf("[-] GetSystemDirectory failed (code %d)\r\n", GetLastError());
+        return false;
+    }
     PathAppendW(termsrv, L"termsrv.dll");
 
     if (!GetFileVersion(termsrv, &_FileVersion)) {
@@ -288,14 +296,20 @@ bool CheckTermsrvVersion(wchar_t *IniPath)
     return true;
 }
 
-void TSConfigFirewall(bool Enable)
+bool TSConfigFirewall(bool Enable)
 {
+    int ret;
     if (Enable) {
-        system("netsh advfirewall firewall add rule name=\"Remote Desktop\" dir=in protocol=tcp localport=3389 profile=any action=allow");
+        ret = system("netsh advfirewall firewall add rule name=\"Remote Desktop\" dir=in protocol=tcp localport=3389 profile=any action=allow");
     }
     else {
-        system("netsh advfirewall firewall delete rule name=\"Remote Desktop\"");
+        ret = system("netsh advfirewall firewall delete rule name=\"Remote Desktop\"");
     }
+    if (ret != 0) {
+        printf("[-] netsh firewall config failed (code %d).\n", ret);
+        return false;
+    }
+    return true;
 }
 
 bool EnableDebugPrivilege()
@@ -432,7 +446,7 @@ bool SvcStart(wchar_t* SvcName)
         goto  __exit;
     }
 
-    hSvc = OpenService(hSc, SvcName, SERVICE_START);
+    hSvc = OpenService(hSc, SvcName, SERVICE_START | SERVICE_QUERY_STATUS);
     if (hSvc == NULL) {
         printf("OpenService error : %d\n", GetLastError());
         goto __exit;
@@ -443,10 +457,16 @@ bool SvcStart(wchar_t* SvcName)
         if (err == ERROR_SERVICE_ALREADY_RUNNING) {// Service already started
             Sleep(2000);            // or SCM hasn't registered killed process
             if (!StartService(hSvc, 0, NULL)) {
-                goto __exit;
-            }
-            else {
-
+                err = GetLastError();
+                // 二次失败可能仍是 1056（SCM 状态滞后），查状态确认是否实际已运行，避免误判
+                SERVICE_STATUS st = { 0 };
+                bool running = (err == ERROR_SERVICE_ALREADY_RUNNING) &&
+                    QueryServiceStatus(hSvc, &st) &&
+                    (st.dwCurrentState == SERVICE_RUNNING);
+                if (!running) {
+                    printf("[*] Start service faild.%d\n", err);
+                    goto __exit;
+                }
             }
         }
         else {
@@ -490,7 +510,7 @@ void SvcConfigStart(const wchar_t* SvcName, DWORD dwStartType)
 
     if (!ChangeServiceConfig(hSvc, SERVICE_NO_CHANGE, dwStartType,
         SERVICE_NO_CHANGE, NULL, NULL, NULL, NULL, NULL, NULL, NULL)) {
-        printf("[-] ChangeServiceConfig error: %d", GetLastError());
+        printf("[-] ChangeServiceConfig error: %d\n", GetLastError());
     }
 
 __exit:
@@ -530,7 +550,7 @@ int SvcGetStart(const wchar_t* SvcName)
     }
 
     if (pcbBytesNeeded) {
-        Buf = (QUERY_SERVICE_CONFIG*)new char[pcbBytesNeeded];
+        Buf = (QUERY_SERVICE_CONFIG*)new (std::nothrow) char[pcbBytesNeeded];
         if (Buf == NULL) {
             printf("no memory\n");
             goto __exit;
@@ -575,6 +595,7 @@ __again:
     // 否则上一轮的 found/again 残留会导致错误分支被跳过或重复循环
     found = false;
     again = false;
+    ShareSvcCount = 0;  // 重试/多次调用均会重新枚举，必须重建列表，否则共享服务重复累积
 
     hSc = OpenSCManager(NULL, SERVICES_ACTIVE_DATABASE, SC_MANAGER_CONNECT | SC_MANAGER_ENUMERATE_SERVICE);
     if (hSc == NULL) {
@@ -597,7 +618,7 @@ __again:
             goto __exit;
         }
 
-        Services = (ENUM_SERVICE_STATUS_PROCESS *)new char[BytesNeeded];
+        Services = (ENUM_SERVICE_STATUS_PROCESS *)new (std::nothrow) char[BytesNeeded];
         if (Services == NULL) {
             printf("new error : %d\n", GetLastError());
             goto __exit;
@@ -620,7 +641,6 @@ __again:
         //TermService
         for (i = 0; i < ServicesReturned; i++) {
             if (!_wcsicmp(Services[i].lpServiceName, TermService)) {
-                StrCpy(TermServiceName, Services[i].lpServiceName);
                 TermServicePID = Services[i].ServiceStatusProcess.dwProcessId;
                 found = true;
                 break;
@@ -696,18 +716,23 @@ __exit:
     }
 }
 
-void SetWrapperDll(wchar_t* path)
+bool SetWrapperDll(wchar_t* path)
 {
     CRegistry reg;
     //%SystemRoot%\System32\termsrv.dll
     if (!reg.Open(L"SYSTEM\\CurrentControlSet\\Services\\TermService\\Parameters", KEY_WRITE | (Arch == 64 ? KEY_WOW64_64KEY : 0))) {
         printf("[-] OpenKey error: %d\n", GetLastError());
-        return;
+        return false;
     }
 
     //必须是REG_EXPAND_SZ，否则找不到文件
     //必须放在system32,否则5
-    reg.WriteExpandSZ(L"ServiceDll", path);
+    //这是安装中唯一真正生效的写入，必须校验结果，否则杀进程后 ServiceDll 仍指向旧库
+    if (!reg.WriteExpandSZ(L"ServiceDll", path)) {
+        printf("[-] Write ServiceDll error: %d\n", GetLastError());
+        return false;
+    }
+    return true;
     /*if (Arch == 64 && FV.Version.w.Major == 6 && FV.Version.w.Minor == 0) {
         system("reg.exe HKLM\SYSTEM\CurrentControlSet\Services\TermService\Parameters /v ServiceDll /t REG_EXPAND_SZ /d WrapPath /f")
     }*/
@@ -780,26 +805,34 @@ int ReleaseFile(LPCTSTR path, LPCTSTR res_type, WORD res_id)
         return GetLastError();
     }
     DWORD dwWrite = 0;
-    WriteFile(hFile, pResData, dwSize, &dwWrite, NULL);
+    if (!WriteFile(hFile, pResData, dwSize, &dwWrite, NULL) || dwWrite != dwSize) {
+        // 部分写入也会落盘残缺 dll，必须报错而非返回成功
+        DWORD err = GetLastError();
+        CloseHandle(hFile);
+        return err != ERROR_SUCCESS ? err : ERROR_WRITE_FAULT;
+    }
     CloseHandle(hFile);
 
     return ERROR_SUCCESS;
 }
 
-void InstallWrapper(wchar_t* wrapper)
+bool InstallWrapper(wchar_t* wrapper)
 {
     wchar_t rfxvmt[MAX_PATH] = { 0 };
     wchar_t rdpwrap[MAX_PATH] = { 0 };
     wchar_t dstini[MAX_PATH] = { 0 };
     wchar_t ini[MAX_PATH] = { 0 };   // 必须在首个 goto __exit 之前声明，否则跳转跨越初始化（仅靠 -fpermissive 才能编译）
     int ret = 0;
+    bool ok = true;
+    bool done = false;   // 是否走到末尾输出阶段（早期 goto 失败路径不算成功）
 
     if (Installed) {
         printf("[*] RDP Wrapper Library is already installed.\n");
-        return;
+        return true;   // 无需安装，幂等视为成功
     }
 
     if (Arch == 64) {
+        // x64 进程中该 API 必然失败（仅对 WoW64 下的 32 位进程有意义），保留调用以兼容 32 位构建
         DisableWowRedirection();
     }
 
@@ -808,8 +841,6 @@ void InstallWrapper(wchar_t* wrapper)
         printf("[*] RDP Wrapper Library not exists.\n");
         goto __exit;
     }
-
-    StrCpy(WrapPath, wrapper);
 
     StrCpyW(ini, wrapper);
     PathRemoveExtension(ini);
@@ -852,16 +883,19 @@ void InstallWrapper(wchar_t* wrapper)
     }
 
     if (!CopyFileW(wrapper, rdpwrap, FALSE)) {
-        printf("[-] Install rfxvmt failed: %d\n", GetLastError());
+        printf("[-] Install rdpwrap.dll failed: %d\n", GetLastError());
         goto __exit;
     }
 
     if (!CopyFileW(ini, dstini, FALSE)) {
-        printf("[-] Install rfxvmt failed: %d\n", GetLastError());
+        printf("[-] Install rdpwrap.ini failed: %d\n", GetLastError());
         goto __exit;
     }
 
-    SetWrapperDll(rdpwrap);
+    if (!SetWrapperDll(rdpwrap)) {
+        // ServiceDll 未写入成功：继续后续流程（重启后仍是旧库），但整体标记为失败
+        ok = false;
+    }
 
     printf("[*] Checking dependencies...\n");
     CheckTermsrvDependencies();
@@ -880,21 +914,36 @@ void InstallWrapper(wchar_t* wrapper)
     }
 
     Sleep(500);
-    SvcStart(TermService);
+    if (!SvcStart(TermService)) {
+        printf("[-] TermService restart failed, please restart it manually.\n");
+        ok = false;
+    }
     Sleep(500);
 
     printf("[*] Configuring registry...\n");
-    TSConfigRegistry(true);
+    if (!TSConfigRegistry(true)) {
+        ok = false;
+    }
     printf("[*] Configuring firewall...\n");
-    TSConfigFirewall(true);
+    if (!TSConfigFirewall(true)) {
+        ok = false;
+    }
 
-    printf("[+] Successfully installed.\n");
+    done = true;
+    if (ok) {
+        printf("[+] Successfully installed.\n");
+    }
+    else {
+        printf("[!] Installed with errors, please check the messages above.\n");
+    }
 
 __exit:
 
     if (Arch == 64) {
         RevertWowRedirection();
     }
+
+    return done && ok;
 }
 
 bool AddPrivilege(const wchar_t* SePriv)
@@ -940,13 +989,26 @@ __exit:
 std::wstring ExpandPath(const wchar_t *Path)
 {
     wchar_t fullpath[MAX_PATH] = { 0 };
-    ExpandEnvironmentStrings(Path, fullpath, MAX_PATH);
+    // 返回 0 为失败；返回 > MAX_PATH 表示缓冲不足（此时缓冲内容不可用），均返回空串
+    DWORD ret = ExpandEnvironmentStrings(Path, fullpath, MAX_PATH);
+    if (ret == 0 || ret > MAX_PATH) {
+        return std::wstring();
+    }
     return std::wstring(fullpath);
 }
 
 void DeleteFiles()
 {
     std::wstring FullPath = ExpandPath(TermServicePath.c_str());
+    if (FullPath.empty()) {
+        printf("[-] Expand ServiceDll path failed, skip file removal.\n");
+        return;
+    }
+    // 注册表值长度不受 MAX_PATH 限制，超长时 wcscpy_s 会触发 invalid parameter 直接 abort
+    if (FullPath.length() >= MAX_PATH) {
+        printf("[-] ServiceDll path too long, skip file removal.\n");
+        return;
+    }
     wchar_t Path[MAX_PATH] = { 0 };
     wchar_t Name[MAX_PATH] = { 0 };
     wcscpy_s(Path, FullPath.c_str());
@@ -974,18 +1036,19 @@ void DeleteFiles()
 
 }
 
-void UninstallWrapper()
+bool UninstallWrapper()
 {
     bool result = false;
     CRegistry reg;
 
     if (!Installed) {
         printf("[*] RDP Wrapper Library is not installed.\n");
-        return;
+        return true;   // 无需卸载，幂等视为成功
     }
     printf("[*] Uninstalling...\n");
 
     if (Arch == 64 ){
+        // x64 进程中该 API 必然失败（仅对 WoW64 下的 32 位进程有意义），保留调用以兼容 32 位构建
         DisableWowRedirection();
     }
 
@@ -1047,7 +1110,8 @@ __exit:
     else {
         printf("[-] Uninstall failed.\n");
     }
-    
+
+    return result;
 }
 
 void ForceRestartTerminalService()
@@ -1056,7 +1120,7 @@ void ForceRestartTerminalService()
 
     CheckTermsrvProcess();
 
-    printf("'[*] Terminating service...\n");
+    printf("[*] Terminating service...\n");
     AddPrivilege(L"SeDebugPrivilege");
     KillProcess(TermServicePID);
     Sleep(1000);
@@ -1077,6 +1141,7 @@ int wmain(int argc, wchar_t* argv[])
     char option[20] = { 0 };
     wchar_t rdpwrap[MAX_PATH] = { 0 };
     bool update = false;
+    int exitCode = 1;   // 悲观默认：仅在流程明确成功时置 0，供 GUI 判定成败
 
     printf("usage: SuperRDP.exe update\n");
     printf("\tupdate: uninstall old version and resintall new version\n\n");
@@ -1108,6 +1173,12 @@ int wmain(int argc, wchar_t* argv[])
         if (Installed) {
             printf("[+] do option 2, uninstall...\n");
             UninstallWrapper();
+            if (Installed) {
+                // 卸载未完全成功也必须清除安装标记，否则 InstallWrapper 会以
+                // "already installed" 早退，导致 update 静默变成空操作
+                printf("[!] Uninstall incomplete, forcing reinstall...\n");
+                Installed = false;
+            }
         }
 
         printf("[+] do option 1, install...\n");
@@ -1120,8 +1191,8 @@ int wmain(int argc, wchar_t* argv[])
             goto __exit;
         }
 
-        InstallWrapper(rdpwrap);
-        printf("[+] done.\n");
+        exitCode = InstallWrapper(rdpwrap) ? 0 : 1;
+        printf("[*] Update flow finished.\n");
 
         goto __exit;
     }
@@ -1133,7 +1204,7 @@ int wmain(int argc, wchar_t* argv[])
     printf("    3: Force restart Terminal Services\n\n");
 
     printf("> ");
-    fflush(stdin);//清除输入
+    fflush(stdin);//清除输入（标准上对输入流 fflush 是 UB，Windows 控制台实现有效）
     option[0] = L'\0';
     scanf("%1s", option);
 
@@ -1149,15 +1220,16 @@ int wmain(int argc, wchar_t* argv[])
             goto __exit;
         }
 
-        InstallWrapper(rdpwrap);
+        exitCode = InstallWrapper(rdpwrap) ? 0 : 1;
     }
     else if (option[0] == '2') {
         printf("[+] Select option 2, uninstall...\n");
-        UninstallWrapper();
+        exitCode = UninstallWrapper() ? 0 : 1;
     }
     else if (option[0] == '3') {
         printf("[+] Select option 3, force restart services...\n");
         ForceRestartTerminalService();
+        exitCode = 0;
     }
     else {
         printf("Invalid option.\n");
@@ -1165,9 +1237,14 @@ int wmain(int argc, wchar_t* argv[])
 
 __exit:
 
+    if (IniFile) {
+        delete IniFile;
+        IniFile = NULL;
+    }
+
     system("pause");
 
-    return 0;
+    return exitCode;
 
 }
 

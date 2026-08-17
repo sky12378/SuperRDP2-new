@@ -97,12 +97,13 @@ BOOL CRegistry::Open(HKEY root, LPCTSTR lpSubKey, DWORD Flag)
 
 void CRegistry::Close()
 {
-    if(m_hKey)
+    // 预定义 hive 句柄（HKEY_LOCAL_MACHINE 等）不可 RegCloseKey：Open 失败时
+    // m_hKey 仍是构造时赋的预定义句柄，直接关闭会导致同进程后续 HKLM 操作异常
+    if(m_hKey && !IsPredefinedHive(m_hKey))
     {
         RegCloseKey(m_hKey);
-        m_hKey=NULL;
     }
-   
+    m_hKey=NULL;
 }
 
 BOOL CRegistry::DeleteValue(LPCTSTR lpValueName)
