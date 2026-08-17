@@ -578,9 +578,11 @@ void PatchSLPolicyInternal(char* Sect)
 
         INIReadString(IniFile, Sect, "SLPolicyFunc.x64", "New_Win8SL", FuncName, 1024);
 
-        if (strcmp(FuncName, "New_Win8SL"))
+        // 原 strcmp 判断方向错误且任何名字都赋同一值（死逻辑）；
+        // x64 只有 New_Win8SL 实现，未知名字回退默认并留日志
+        if (strcmp(FuncName, "New_Win8SL") != 0)
         {
-            Jump.MovArg = (PLATFORM_DWORD)New_Win8SL;
+            WriteToLog("Warning: unknown SLPolicyFunc '%s', fallback to New_Win8SL\r\n", FuncName);
         }
 #else
         SignPtr = (PLATFORM_DWORD)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "SLPolicyOffset.x86", 0));
@@ -590,13 +592,18 @@ void PatchSLPolicyInternal(char* Sect)
 
         INIReadString(IniFile, Sect, "SLPolicyFunc.x86", "New_Win8SL", FuncName, 1024);
 
-        if (strcmp(FuncName, "New_Win8SL"))
-        {
-            Jump.PushArg = (PLATFORM_DWORD)New_Win8SL;
-        }
-        if (strcmp(FuncName, "New_Win8SL_CP"))
+        // 原两个 strcmp 均反向且会先后覆盖：配置 New_Win8SL 时最终会被误设为 New_Win8SL_CP
+        if (strcmp(FuncName, "New_Win8SL_CP") == 0)
         {
             Jump.PushArg = (PLATFORM_DWORD)New_Win8SL_CP;
+        }
+        else
+        {
+            if (strcmp(FuncName, "New_Win8SL") != 0)
+            {
+                WriteToLog("Warning: unknown SLPolicyFunc '%s', fallback to New_Win8SL\r\n", FuncName);
+            }
+            Jump.PushArg = (PLATFORM_DWORD)New_Win8SL;
         }
 #endif
         delete[] FuncName;
@@ -643,9 +650,11 @@ void PatchSLInit(char* Sect)
 
         INIReadString(IniFile, Sect, "SLInitFunc.x64", "New_CSLQuery_Initialize", FuncName, 1024);
 
-        if (strcmp(FuncName, "New_CSLQuery_Initialize"))
+        // 原 strcmp 判断方向错误且任何名字都赋同一值（死逻辑）；
+        // 只有 New_CSLQuery_Initialize 实现，未知名字回退默认并留日志
+        if (strcmp(FuncName, "New_CSLQuery_Initialize") != 0)
         {
-            Jump.MovArg = (PLATFORM_DWORD)New_CSLQuery_Initialize;
+            WriteToLog("Warning: unknown SLInitFunc '%s', fallback to New_CSLQuery_Initialize\r\n", FuncName);
         }
 #else
         SignPtr = (PLATFORM_DWORD)(TermSrvBase + INIReadDWordHex(IniFile, Sect, "SLInitOffset.x86", 0));
@@ -655,9 +664,9 @@ void PatchSLInit(char* Sect)
 
         INIReadString(IniFile, Sect, "SLInitFunc.x86", "New_CSLQuery_Initialize", FuncName, 1024);
 
-        if (strcmp(FuncName, "New_CSLQuery_Initialize"))
+        if (strcmp(FuncName, "New_CSLQuery_Initialize") != 0)
         {
-            Jump.PushArg = (PLATFORM_DWORD)New_CSLQuery_Initialize;
+            WriteToLog("Warning: unknown SLInitFunc '%s', fallback to New_CSLQuery_Initialize\r\n", FuncName);
         }
 #endif
         delete[] FuncName;

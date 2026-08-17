@@ -22,10 +22,22 @@ CRegistry::~CRegistry()
 /////////////////////////////////////////////////////////////////////////////
 // CRegistry Functions
 
+// 预定义句柄（hive 根）不可 RegCloseKey：单参重载里 m_hKey 可能是
+// 双参重载刚赋值的 HKEY_LOCAL_MACHINE 等，只有非预定义句柄才能关闭
+static bool IsPredefinedHive(HKEY h)
+{
+    return h == HKEY_LOCAL_MACHINE || h == HKEY_CURRENT_USER ||
+           h == HKEY_CLASSES_ROOT || h == HKEY_USERS ||
+           h == HKEY_CURRENT_CONFIG || h == HKEY_PERFORMANCE_DATA;
+}
+
 BOOL CRegistry::CreateKey(LPCTSTR lpSubKey, DWORD Flag/* = 0*/)
 {
     assert(m_hKey);
     assert(lpSubKey);
+
+    // 若当前持有的是上次 Open/CreateKey 的实句柄，先关闭避免泄漏
+    if (!IsPredefinedHive(m_hKey)) Close();
 
     HKEY hKey;
     DWORD dw;
@@ -56,6 +68,9 @@ BOOL CRegistry::Open(LPCTSTR lpSubKey, DWORD Flag /*= 0*/)
 {
     assert(m_hKey);
     assert(lpSubKey);
+
+    // 若当前持有的是上次 Open/CreateKey 的实句柄，先关闭避免泄漏
+    if (!IsPredefinedHive(m_hKey)) Close();
    
     HKEY hKey;
     long lReturn=RegOpenKeyEx(m_hKey,lpSubKey,0L,/*KEY_ALL_ACCESS | Flag*/Flag,&hKey);

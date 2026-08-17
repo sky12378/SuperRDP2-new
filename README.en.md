@@ -98,7 +98,7 @@ After a major Windows update RDP may break — pick one:
 
 Requires MinGW-w64 toolchain in PATH (`x86_64-w64-mingw32-g++`, `x86_64-w64-mingw32-windres`). Tested with GCC 8.1 through 13.
 
-The source already ships with MSVC→GCC porting patches (relative to the upstream original): UTF-16LE→UTF-8, removed SAL annotations, `extern "C"` exports, zero-length array fix, `scanf_s`→`scanf`, `-fpack-struct=1` (RDPWrap.dll only).
+The source already ships with MSVC→GCC porting patches (relative to the upstream original): UTF-16LE→UTF-8, removed SAL annotations, `extern "C"` exports, zero-length array fix, `scanf_s`→`scanf`. The old global `-fpack-struct=1` (RDPWrap.dll only) was removed in 2026-08: it also changed Win32 struct layouts and broke ABI compatibility with the system; the packed trampoline struct (FARJMP) now uses `#pragma pack` locally instead.
 
 ## Directory Layout
 

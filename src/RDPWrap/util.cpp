@@ -114,20 +114,24 @@ void SetThreadsState(bool Resume)
     if (h != INVALID_HANDLE_VALUE)
     {
         Thread.dwSize = sizeof(THREADENTRY32);
-        Thread32First(h, &Thread);
-        do
+        // 必须检查 Thread32First 返回值：失败时 Thread 内容未定义，
+        // 直接进循环会对随机线程 ID 做挂起/恢复
+        if (Thread32First(h, &Thread))
         {
-            if (Thread.th32ThreadID != CurrTh && Thread.th32OwnerProcessID == CurrPr)
+            do
             {
-                hThread = OpenThread(THREAD_SUSPEND_RESUME, false, Thread.th32ThreadID);
-                if (hThread != INVALID_HANDLE_VALUE)
+                if (Thread.th32ThreadID != CurrTh && Thread.th32OwnerProcessID == CurrPr)
                 {
-                    if (Resume)		ResumeThread(hThread);
-                    else			SuspendThread(hThread);
-                    CloseHandle(hThread);
+                    hThread = OpenThread(THREAD_SUSPEND_RESUME, false, Thread.th32ThreadID);
+                    if (hThread != INVALID_HANDLE_VALUE)
+                    {
+                        if (Resume)		ResumeThread(hThread);
+                        else			SuspendThread(hThread);
+                        CloseHandle(hThread);
+                    }
                 }
-            }
-        } while (Thread32Next(h, &Thread));
+            } while (Thread32Next(h, &Thread));
+        }
         CloseHandle(h);
     }
 }

@@ -43,6 +43,7 @@ INI_FILE::INI_FILE(wchar_t *FilePath)
 	FileSize = GetFileSize(hFile, NULL);
 	if (FileSize == INVALID_FILE_SIZE)
 	{
+		CloseHandle(hFile);   // 防句柄泄漏
 		return;
 	}
 
@@ -50,8 +51,11 @@ INI_FILE::INI_FILE(wchar_t *FilePath)
 	Status = ReadFile(hFile, FileRaw, FileSize, &NumberOfBytesRead, NULL);
 	if (!Status)
 	{
+		CloseHandle(hFile);   // 防句柄泄漏
 		return;
 	}
+
+	CloseHandle(hFile);
 
 	CreateStringsMap();
 	Parse();
@@ -66,7 +70,7 @@ INI_FILE::~INI_FILE()
 	}
 	delete[] IniData.Section;
 	delete[] FileStringsMap;
-	delete FileRaw;
+	delete[] FileRaw;	// new char[] 分配必须 delete[]，原 delete 为未定义行为
 }
 
 bool INI_FILE::CreateStringsMap()
@@ -115,15 +119,13 @@ int INI_FILE::StrTrim(char* Str)
 		Str[j] = '\0';
 	}
 
-	i = strlen(Str) - 1;
-	while ((Str[i] == ' ') || (Str[i] == '\t'))
+	i = (int)strlen(Str) - 1;
+	// 空串时 i 为 -1，必须限制下界，否则 Str[-1] 越界读
+	while ((i >= 0) && ((Str[i] == ' ') || (Str[i] == '\t')))
 	{
 		i--;
 	}
-	if (i < (strlen(Str) - 1))
-	{
-		Str[i + 1] = '\0';
-	}
+	Str[i + 1] = '\0';
 	return 0;
 }
 
@@ -153,7 +155,12 @@ DWORD INI_FILE::GetFileStringFromNum(DWORD StringNumber, char *RetString, DWORD 
 
 	StringSize = EndStringPos - FileStringsMap[StringNumber];
 
-	if (Size < StringSize) return 0;
+	if (Size < StringSize)
+	{
+		// 行超长时清零输出缓冲：调用方拿到空串而非上一行的残留内容
+		memset(RetString, 0x00, Size);
+		return 0;
+	}
 
 	memset(RetString, 0x00, Size);
 	memcpy(RetString, &(FileRaw[FileStringsMap[StringNumber]]), StringSize);
@@ -181,10 +188,15 @@ bool INI_FILE::FillVariable(INI_SECTION_VARIABLE *Variable, char *Str, DWORD Str
 		if (Str[i] == '"' || Str[i] == '\'') Quotes = !Quotes;
 		if (Str[i] == '=' && !Quotes)
 		{
+			// 限制拷入长度，防行内 name/value 超过 MAX_STRING_LEN 时堆溢出
+			DWORD NameLen = i;
+			if (NameLen > MAX_STRING_LEN - 1) NameLen = MAX_STRING_LEN - 1;
+			DWORD ValueLen = StrSize - (i + 1);
+			if (ValueLen > MAX_STRING_LEN - 1) ValueLen = MAX_STRING_LEN - 1;
 			memset(Variable->VariableName, 0, MAX_STRING_LEN);
 			memset(Variable->VariableValue, 0, MAX_STRING_LEN);
-			memcpy(Variable->VariableName, Str, i);
-			memcpy(Variable->VariableValue, &(Str[i + 1]), StrSize - (i + 1));
+			memcpy(Variable->VariableName, Str, NameLen);
+			memcpy(Variable->VariableValue, &(Str[i + 1]), ValueLen);
 			StrTrim(Variable->VariableName);
 			StrTrim(Variable->VariableValue);
 			break;
@@ -248,7 +260,7 @@ bool INI_FILE::Parse()
 
 	IniData.SectionCount = SectionsCount;
 	IniData.Section = new INI_SECTION[SectionsCount];
-	memset(IniData.Section, 0x00, sizeof(PINI_SECTION)*SectionsCount);
+	memset(IniData.Section, 0x00, sizeof(INI_SECTION)*SectionsCount);
 
 	for (DWORD i = 0; i < SectionsCount; i++)
 	{

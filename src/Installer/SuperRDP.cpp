@@ -91,8 +91,8 @@ bool CheckInstall()
 
     //%SystemRoot%\System32\svchost.exe -k NetworkService
 
-    if (TermServiceHost.find(L"svchost.exe") == std::string::npos &&
-        TermServiceHost.find(L"svchost -k") == std::string::npos) {
+    if (TermServiceHost.find(L"svchost.exe") == std::wstring::npos &&
+        TermServiceHost.find(L"svchost -k") == std::wstring::npos) {
         printf("[-] TermService is hosted in a custom application (BeTwin, etc.) - unsupported.\n");
         printf("[*] ImagePath: %ws\n", TermServiceHost.c_str());
     }
@@ -113,8 +113,8 @@ bool CheckInstall()
     _wcslwr_s(&TermServicePathLower[0], TermServicePathLower.size() + 1);
     TermServicePath.swap(TermServicePathLower);
 
-    if (TermServicePath.find(L"termsrv.dll") == std::string::npos &&
-        TermServicePath.find(L"rdpwrap.dll") == std::string::npos) {
+    if (TermServicePath.find(L"termsrv.dll") == std::wstring::npos &&
+        TermServicePath.find(L"rdpwrap.dll") == std::wstring::npos) {
         printf("[-] TermService is hosted in a custom application (BeTwin, etc.) - unsupported.\n");
         printf("[*] ImagePath: %ws\n", TermServicePath.c_str());
     }
@@ -246,6 +246,11 @@ BOOL __stdcall GetFileVersion(LPCWSTR lptstrFilename, FILE_VERSION* FileVersion)
 
 bool CheckTermsrvVersion(wchar_t *IniPath)
 {
+    // 全局 IniFile 可能残留上一次的实例，先释放避免泄漏
+    if (IniFile) {
+        delete IniFile;
+        IniFile = NULL;
+    }
     IniFile = new (std::nothrow) INI_FILE(IniPath);
     FILE_VERSION _FileVersion = { 0 };
     wchar_t termsrv[MAX_PATH] = { 0 };
@@ -301,8 +306,10 @@ bool EnableDebugPrivilege()
         tp.Privileges[0].Luid = luid;
         tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
         AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
+        // AdjustTokenPrivileges 可能返回 TRUE 但实际未全部授予，需再查 GetLastError
+        bool ok = (GetLastError() == ERROR_SUCCESS);
         CloseHandle(hToken);
-        return TRUE;
+        return ok;
     }
     return FALSE;
 }
@@ -641,7 +648,8 @@ __again:
             if (Services[i].lpServiceName) {
                 if (Services[i].ServiceStatusProcess.dwProcessId == TermServicePID) {
                     if (_wcsicmp(Services[i].lpServiceName, TermService)) {
-                        if (ShareSvcCount > 100) {
+                        // 数组大小 100，索引达到 100 即越界，必须 >= 判断
+                        if (ShareSvcCount >= 100) {
                             printf("ShareSvcCount = %d\n", ShareSvcCount);
                             break;
                         }
@@ -765,6 +773,7 @@ void InstallWrapper(wchar_t* wrapper)
     wchar_t rfxvmt[MAX_PATH] = { 0 };
     wchar_t rdpwrap[MAX_PATH] = { 0 };
     wchar_t dstini[MAX_PATH] = { 0 };
+    wchar_t ini[MAX_PATH] = { 0 };   // 必须在首个 goto __exit 之前声明，否则跳转跨越初始化（仅靠 -fpermissive 才能编译）
     int ret = 0;
 
     if (Installed) {
@@ -776,34 +785,34 @@ void InstallWrapper(wchar_t* wrapper)
         DisableWowRedirection();
     }
 
+    // 后续所有失败路径统一 goto __exit，避免已禁用的 WoW64 重定向不回滚
     if (!PathFileExists(wrapper)) {
         printf("[*] RDP Wrapper Library not exists.\n");
-        return;
+        goto __exit;
     }
 
     StrCpy(WrapPath, wrapper);
 
-    wchar_t ini[MAX_PATH] = { 0 };
     StrCpyW(ini, wrapper);
     PathRemoveExtension(ini);
     StrCatW(ini, L".ini");
 
     if (!PathFileExists(ini)) {
         printf("[*] RDP Wrapper Library or config file not found.\n");
-        return;
+        goto __exit;
     }
 
     printf("[*] Installing...\n");
 
     if (!CheckTermsrvVersion(ini)) {
-        return;
+        goto __exit;
     }
 
     CheckTermsrvProcess();
 
     if (TermServicePID == 0) {
         printf("[*] Get TermService PID failed\n");
-        return;
+        goto __exit;
     }
 
     printf("[*] Configuring service library...\n");
@@ -894,8 +903,12 @@ bool AddPrivilege(const wchar_t* SePriv)
     if (!AdjustTokenPrivileges(hToken, FALSE, &tkp, sizeof(tkp), NULL, NULL)) {
         printf("[-] AdjustTokenPrivileges error (code %d).\n", GetLastError());
     }
-
-    result = true;
+    else if (GetLastError() == ERROR_NOT_ALL_ASSIGNED) {
+        printf("[-] AdjustTokenPrivileges: privilege not assigned (code %d).\n", GetLastError());
+    }
+    else {
+        result = true;
+    }
 
 __exit:
     if (hToken) {
@@ -1014,7 +1027,7 @@ __exit:
         printf("[+] Successfully uninstalled.\n");
     }
     else {
-        printf("[+] Uninstall failed.\n");
+        printf("[-] Uninstall failed.\n");
     }
     
 }

@@ -20,10 +20,13 @@ WINDRES="$P-windres"
 command -v "$WINDRES" >/dev/null 2>&1 || WINDRES=windres
 
 # ---------- RDPWrap.dll (service wrapper) ----------
+# 不再使用全局 -fpack-struct=1：它会把 THREADENTRY32/VS_VERSIONINFO 等 Win32 结构
+# 的对齐/步长也改掉，与系统 ABI 不一致（隐患）。需要紧凑布局的 FARJMP 已在
+# stdafx.h 内用 #pragma pack(push,1) 单独处理。
 cd "$ROOT/src/RDPWrap"
 $P-g++ -shared -O2 -fpermissive -include stdafx.h \
   -DUNICODE -D_UNICODE -DNDEBUG -DWIN32 -D_WINDOWS -D_USRDLL -DRDPWRAP_EXPORTS \
-  -fpack-struct=1 -static -Wl,--subsystem,windows \
+  -static -Wl,--subsystem,windows \
   -o ../../bin/$ARCH/RDPWrap.dll \
   dllmain.cpp IniFile.cpp RDPWrap.cpp stdafx.cpp util.cpp Export.def -lshlwapi
 

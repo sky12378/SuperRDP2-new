@@ -99,7 +99,7 @@ Windows 大版本更新后 RDP 可能失效，任选其一：
 
 要求：PATH 中有 MinGW-w64 工具链（`x86_64-w64-mingw32-g++`、`x86_64-w64-mingw32-windres`）。实测 GCC 8.1 ~ 13 均可构建。
 
-源码已内置 MSVC→GCC 移植补丁（相对上游原版）：UTF-16LE→UTF-8、移除 SAL 注解、`extern "C"` 导出、零长数组修正、`scanf_s`→`scanf`、`-fpack-struct=1`（仅 RDPWrap.dll）。
+源码已内置 MSVC→GCC 移植补丁（相对上游原版）：UTF-16LE→UTF-8、移除 SAL 注解、`extern "C"` 导出、零长数组修正、`scanf_s`→`scanf`。早期曾用全局 `-fpack-struct=1`（仅 RDPWrap.dll），2026-08 已移除：它会连带改变 Win32 结构布局、与系统 ABI 不一致；需要紧凑布局的跳板结构（FARJMP）改用 `#pragma pack` 单独处理。
 
 ## 目录结构
 

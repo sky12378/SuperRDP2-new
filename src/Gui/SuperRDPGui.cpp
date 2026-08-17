@@ -34,6 +34,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>   // LLONG_MAX（SLInit 候选段距离计算）
 #include <string>
 #include <vector>
 
@@ -113,7 +114,7 @@ static void InitLogFile()
         ReadFile(f, head, 3, &rd, NULL);
         if (rd == 3 &&
             ((head[0] == 0xEF && head[1] == 0xBB && head[2] == 0xBF) ||  // UTF-8 BOM
-             (head[0] == 0xFF && head[1] == 0xFE && head[2] == 0x00) ||  // UTF-16 LE BOM
+             (head[0] == 0xFF && head[1] == 0xFE) ||                      // UTF-16 LE BOM（第三字节是正文，不可参与判断）
              (head[0] == 0xFE && head[1] == 0xFF)))                       // UTF-16 BE BOM
             needReset = true;
     } else if (sz.QuadPart == 2) {
@@ -173,11 +174,13 @@ static void Log(const wchar_t* fmt, ...)
     va_start(ap, fmt);
     _vsnwprintf(buf, 4096, fmt, ap);
     va_end(ap);
+    buf[4095] = 0;   // MSVC 语义截断时不补 NUL，手动终止防 wcslen 越界
 
     SYSTEMTIME st;
     GetLocalTime(&st);
     wchar_t line[4300];
     _snwprintf(line, 4300, L"[%02d:%02d:%02d] %s\r\n", st.wHour, st.wMinute, st.wSecond, buf);
+    line[4299] = 0;
 
     LogToFile(line);
     OutputDebugStringW(line);
@@ -370,30 +373,36 @@ static std::wstring IniPath()
 
 static bool IniHasSection(const wchar_t* ini, const wchar_t* ver)
 {
-    wchar_t want[128]; _snwprintf(want, 128, L"[%s]", ver);
+    wchar_t want[128]; _snwprintf(want, 128, L"[%s]", ver); want[127] = 0;
     HANDLE f = CreateFileW(ini, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return false;
     std::string line;
     bool found = false;
+    // 单行比对（trim 后 UTF-8 转宽字符，忽略大小写）
+    auto checkLine = [&](std::string& ln) {
+        while (!ln.empty() && (ln.back() == '\r' || ln.back() == ' ')) ln.pop_back();
+        int n = MultiByteToWideChar(CP_UTF8, 0, ln.c_str(), -1, NULL, 0);
+        if (n > 0) {
+            std::vector<wchar_t> w(n);
+            MultiByteToWideChar(CP_UTF8, 0, ln.c_str(), -1, w.data(), n);
+            if (!_wcsicmp(w.data(), want)) return true;
+        }
+        return false;
+    };
     // 块读取（64KB），避免逐字节 ReadFile 造成 55 万次系统调用
     char buf[65536]; DWORD rd;
     while (ReadFile(f, buf, sizeof(buf), &rd, NULL) && rd) {
         for (DWORD i = 0; i < rd; i++) {
             char c = buf[i];
             if (c == '\n') {
-                // trim
-                while (!line.empty() && (line.back() == '\r' || line.back() == ' ')) line.pop_back();
-                int n = MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, NULL, 0);
-                if (n > 0) {
-                    std::vector<wchar_t> w(n);
-                    MultiByteToWideChar(CP_UTF8, 0, line.c_str(), -1, w.data(), n);
-                    if (!_wcsicmp(w.data(), want)) { found = true; break; }
-                }
+                if (checkLine(line)) { found = true; break; }
                 line.clear();
             } else line += c;
         }
         if (found) break;
     }
+    // 文件末尾无换行时，最后一行尚未参与比对
+    if (!found && !line.empty()) found = checkLine(line);
     CloseHandle(f);
     return found;
 }
@@ -402,11 +411,15 @@ static bool AppendIniSection(const wchar_t* ini, const wchar_t* ver, const Analy
 {
     HANDLE f = CreateFileW(ini, FILE_APPEND_DATA, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return false;
-    char sec[2044]; int n = 0;
-    // #12: 累加时防护剩余长度，避免 2044-n 变负导致 _snprintf 未定义行为 / n 被当极大值
+    char sec[2044]; int n = 0; sec[0] = 0;
+    // #12: 累加时防护剩余长度；截断时 k 钳位到实际写入长度，n 始终等于真实内容长，sec 始终有终止符
 #define APP_SEC(...) do { \
-        if (n < 0) n = 0; \
-        if (n < 2044) { int k = _snprintf(sec + n, 2044 - n, __VA_ARGS__); if (k > 0) n += k; if (n > 2044) n = 2044; } \
+        if (n >= 0 && n < 2043) { \
+            int rem = 2043 - n; \
+            int k = _snprintf(sec + n, rem + 1, __VA_ARGS__); \
+            if (k < 0 || k > rem) k = rem; \
+            n += k; sec[n] = '\0'; \
+        } \
     } while (0)
     APP_SEC("\r\n[%ls]\r\n", ver);
     if (r.localOnlyFound)
@@ -431,9 +444,13 @@ static const wchar_t* kIniUrls[] = {
     L"https://raw.githubusercontent.com/stascorp/rdpwrap/master/res/rdpwrap.ini",
 };
 
-static bool DownloadIni(const wchar_t* dest, bool verbose)
+// changed（可选）：输出"内容是否真的变化"。LastWriteTime 不可靠——
+// URLDownloadToFileW 的时间戳取决于代理是否透传 Last-Modified，
+// 代理剥离该头时会误判为变化，导致开机静默模式每次启动都卸载+重装
+static bool DownloadIni(const wchar_t* dest, bool verbose, bool* changed = NULL)
 {
-    wchar_t tmp[MAX_PATH]; _snwprintf(tmp, MAX_PATH, L"%s.new", dest);
+    if (changed) *changed = true;  // 保守默认：无法确认时按已变化处理
+    wchar_t tmp[MAX_PATH]; _snwprintf(tmp, MAX_PATH, L"%s.new", dest); tmp[MAX_PATH - 1] = 0;
     // 国内直连 raw.githubusercontent.com 基本失败，统一走 GitHub 代理；代理失败再回退直连
     const wchar_t* kProxyPrefix = L"https://gh-proxy.com/";
     for (auto url : kIniUrls) {
@@ -465,10 +482,19 @@ static bool DownloadIni(const wchar_t* dest, bool verbose)
             DeleteFileW(tmp);
             continue;
         }
-        // backup old, replace
-        wchar_t bak[MAX_PATH]; _snwprintf(bak, MAX_PATH, L"%s.bak", dest);
-        DeleteFileW(bak);
-        MoveFileW(dest, bak);   // may fail if not exist - fine
+        // backup old（只拷贝不移动：替换失败时原文件仍在原位），再替换
+        wchar_t bak[MAX_PATH]; _snwprintf(bak, MAX_PATH, L"%s.bak", dest); bak[MAX_PATH - 1] = 0;
+        DeleteFileW(bak);               // 先删旧备份，否则第二次起 CopyFileW 静默失败、备份永远陈旧
+        CopyFileW(dest, bak, FALSE);    // dest 不存在时失败无所谓
+        // 内容级比较：避免时间戳误判（见函数头注释）
+        std::vector<BYTE> oldBuf;
+        if (ReadWholeFile(dest, oldBuf) && oldBuf.size() + 1 == buf.size() &&
+            memcmp(oldBuf.data(), buf.data(), oldBuf.size()) == 0) {
+            if (changed) *changed = false;
+            DeleteFileW(tmp);           // 内容未变，无需替换
+            if (verbose) Log(L"[*] config unchanged, skip replace");
+            return true;
+        }
         if (!MoveFileW(tmp, dest)) { if (verbose) Log(L"[-] replace config failed: %u", GetLastError()); return false; }
         if (verbose) Log(L"[+] config synced (%.0f KB)", (double)buf.size() / 1024.0);
         return true;
@@ -540,6 +566,7 @@ static int RunInstaller(const wchar_t* option, const wchar_t* extraArg = NULL)
         _snwprintf(cmd, MAX_PATH + 64, L"\"%ls\" %ls", exe.c_str(), extraArg);
     else
         _snwprintf(cmd, MAX_PATH + 64, L"\"%ls\"", exe.c_str());
+    cmd[MAX_PATH + 63] = 0;
 
     SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
     HANDLE outR = NULL, outW = NULL, inR = NULL, inW = NULL;
@@ -603,13 +630,26 @@ static int RunInstaller(const wchar_t* option, const wchar_t* extraArg = NULL)
             Sleep(100);
         }
     }
-    // drain remaining output until EOF/exit
-    while (ReadFile(outR, rbuf, sizeof(rbuf), &rd, NULL) && rd) AppendToLogMB(rbuf, rd);
-    WaitForSingleObject(pi.hProcess, 5000);
-    if (WaitForSingleObject(pi.hProcess, 0) == WAIT_TIMEOUT) {
+    // 先确保子进程退出，再排空残余输出。
+    // 若先阻塞 ReadFile 排空：管道写端被子进程/孙进程占用且不输出时会永久阻塞，
+    // 超时/强杀永远执行不到 → worker 挂死 → 所有按钮永久禁用
+    if (WaitForSingleObject(pi.hProcess, 5000) == WAIT_TIMEOUT) {
         Log(L"[!] 安装器未正常退出，强制结束");
         TerminateProcess(pi.hProcess, 0);
         WaitForSingleObject(pi.hProcess, 3000);
+    }
+    // 非阻塞排空（Peek + 截止时间）：进程已退出，写端关闭后自然 EOF
+    DWORD drainStart = GetTickCount();
+    for (;;) {
+        DWORD avail = 0;
+        if (!PeekNamedPipe(outR, NULL, 0, NULL, &avail, NULL)) break;  // pipe closed
+        if (avail > 0) {
+            if (!ReadFile(outR, rbuf, sizeof(rbuf), &rd, NULL) || rd == 0) break;
+            AppendToLogMB(rbuf, rd);
+            continue;
+        }
+        if (GetTickCount() - drainStart >= 1000) break;
+        Sleep(50);
     }
     DWORD code = 0; GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
@@ -619,39 +659,53 @@ static int RunInstaller(const wchar_t* option, const wchar_t* extraArg = NULL)
 
 // try to clone a sibling -SLInit data section (same a.b.c series) under a new name.
 // data offsets are typically stable within one build series (e.g. 10.0.28000.*)
+// 多个候选时选第 4 段 build 号与目标最接近的（README：克隆自同系列最近版本）
 static bool CopySiblingSLInit(const wchar_t* ini, const wchar_t* ver, std::string& out)
 {
     // ver = "a.b.c.d" -> prefix "a.b.c."
     wchar_t wprefix[64];
-    wcsncpy(wprefix, ver, 63);
+    wcsncpy(wprefix, ver, 63); wprefix[63] = 0;
     wchar_t* last = wcsrchr(wprefix, L'.');
     if (!last) return false;
     *(last + 1) = 0;  // "10.0.28000."
+    size_t prefixLen = wcslen(wprefix);
+    // 目标的第 4 段 build 号
+    const wchar_t* dver = wcsrchr(ver, L'.');
+    long long targetBuild = dver ? _wcstoi64(dver + 1, NULL, 10) : -1;
 
     HANDLE f = CreateFileW(ini, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return false;
-    std::string content;
-    DWORD rd;
-    std::string line;
-    bool copying = false, found = false, done = false;
+    struct Cand { long long dist; std::vector<std::string> body; };
+    std::vector<Cand> cands;
     std::vector<std::string> body;
+    long long curDist = 0;
+    bool copying = false;
+    std::string line;
     // 块读取（64KB），避免逐字节 ReadFile 造成 55 万次系统调用
-    char buf[65536];
-    while (!done && ReadFile(f, buf, sizeof(buf), &rd, NULL) && rd) {
-        for (DWORD i = 0; i < rd && !done; i++) {
+    char buf[65536]; DWORD rd;
+    while (ReadFile(f, buf, sizeof(buf), &rd, NULL) && rd) {
+        for (DWORD i = 0; i < rd; i++) {
             char c = buf[i];
             if (c == '\n') {
                 while (!line.empty() && (line.back() == '\r')) line.pop_back();
                 if (line.size() > 1 && line[0] == '[') {
-                    if (copying) { copying = false; done = true; }  // first sibling complete -> stop
-                    else {
-                        // check "[a.b.c.*-SLInit]"
-                        if (line.find("-SLInit]") != std::string::npos) {
-                            int n = MultiByteToWideChar(CP_UTF8, 0, line.c_str() + 1, -1, NULL, 0);
+                    if (copying) {  // 上一个候选段结束，收入列表继续找下一个
+                        Cand cd; cd.dist = curDist; cd.body.swap(body);
+                        if (!cd.body.empty()) cands.push_back(cd);
+                        copying = false;
+                    }
+                    // check "[a.b.c.*-SLInit]"
+                    if (line.find("-SLInit]") != std::string::npos) {
+                        int n = MultiByteToWideChar(CP_UTF8, 0, line.c_str() + 1, -1, NULL, 0);
+                        if (n > 0) {
                             std::vector<wchar_t> w(n);
                             MultiByteToWideChar(CP_UTF8, 0, line.c_str() + 1, -1, w.data(), n);
-                            if (wcsncmp(w.data(), wprefix, wcslen(wprefix)) == 0) {
-                                copying = true; found = true;
+                            if (wcsncmp(w.data(), wprefix, prefixLen) == 0) {
+                                long long build = _wcstoi64(w.data() + prefixLen, NULL, 10);
+                                curDist = (targetBuild < 0 || build < 0) ? LLONG_MAX
+                                          : (build > targetBuild ? build - targetBuild : targetBuild - build);
+                                body.clear();
+                                copying = true;
                             }
                         }
                     }
@@ -663,18 +717,25 @@ static bool CopySiblingSLInit(const wchar_t* ini, const wchar_t* ver, std::strin
         }
     }
     CloseHandle(f);
-    if (!found || body.empty()) return false;
+    if (copying) {  // 文件末尾的最后一个候选段
+        Cand cd; cd.dist = curDist; cd.body.swap(body);
+        if (!cd.body.empty()) cands.push_back(cd);
+    }
+    if (cands.empty()) return false;
+    size_t bestIdx = 0;
+    for (size_t i = 1; i < cands.size(); i++)
+        if (cands[i].dist < cands[bestIdx].dist) bestIdx = i;
     char hdr[128];
-    _snprintf(hdr, 128, "[%ls-SLInit]\r\n", ver);
+    _snprintf(hdr, 128, "[%ls-SLInit]\r\n", ver); hdr[127] = 0;
     out = hdr;
-    for (auto& l : body) { out += l; out += "\r\n"; }
+    for (auto& l : cands[bestIdx].body) { out += l; out += "\r\n"; }
     return true;
 }
 
 // SuperRDP2 workflow: 备份当前配置到程序目录（写入前留底）
 static void BackupIni(const wchar_t* ini)
 {
-    wchar_t bak[MAX_PATH]; _snwprintf(bak, MAX_PATH, L"%ls.autobak", ini);
+    wchar_t bak[MAX_PATH]; _snwprintf(bak, MAX_PATH, L"%ls.autobak", ini); bak[MAX_PATH - 1] = 0;
     CopyFileW(ini, bak, FALSE);  // best-effort
 }
 
@@ -740,8 +801,8 @@ static void SetBoot(bool on)
         return;
     }
     if (on) {
-        wchar_t p[MAX_PATH]; GetModuleFileNameW(NULL, p, MAX_PATH);
-        wchar_t v[MAX_PATH + 4]; _snwprintf(v, MAX_PATH + 4, L"\"%ls\" /silent", p);
+        wchar_t p[MAX_PATH]; GetModuleFileNameW(NULL, p, MAX_PATH); p[MAX_PATH - 1] = 0;
+        wchar_t v[MAX_PATH + 16]; _snwprintf(v, MAX_PATH + 16, L"\"%ls\" /silent", p); v[MAX_PATH + 15] = 0;
         RegSetValueExW(k, L"SuperRDP", 0, REG_SZ, (LPBYTE)v, (DWORD)((wcslen(v) + 1) * sizeof(wchar_t)));
         Log(L"[+] 已开启开机自动支持（静默同步+分析+更新）");
     } else {
@@ -758,6 +819,36 @@ struct StatusInfo {
     wchar_t latest[64];    // newest build supported by the (online-synced) ini
 };
 
+// 解析单行 "[a.b.c.d]" / "[a.b.c.d-SLInit]"，命中且大于当前 best 则更新 out
+static void ParseIniVersionLine(const char* line, int best[4], wchar_t* out, size_t cch)
+{
+    if (line[0] != '[') return;
+    int v[4]; int n = 0; const char* p = line + 1;
+    while (n < 4) {
+        const char* e = p; long val = 0; int digits = 0;
+        while (*e >= '0' && *e <= '9') { val = val * 10 + (*e - '0'); e++; digits++; }
+        if (!digits) break;
+        v[n++] = (int)val;
+        if (*e != '.') break;
+        p = e + 1;
+    }
+    if (n != 4) return;
+    // section header must end right after the 4th number ("]" or "-SLInit]")
+    const char* after = line + 1;
+    for (int k = 0; k < 4; k++) { while (*after >= '0' && *after <= '9') after++; if (k < 3) after++; }
+    if (*after != ']' && *after != '-') return;
+    bool better = false;
+    for (int k = 0; k < 4 && !better; k++) {
+        if (v[k] > best[k]) better = true;
+        if (v[k] < best[k]) break;
+    }
+    if (better) {
+        memcpy(best, v, sizeof(v));
+        _snwprintf(out, cch, L"%d.%d.%d.%d", v[0], v[1], v[2], v[3]);
+        out[cch - 1] = 0;
+    }
+}
+
 // scan ini for the highest "[a.b.c.d]" build section
 static void LatestIniVersion(const wchar_t* ini, wchar_t* out, size_t cch)
 {
@@ -773,35 +864,13 @@ static void LatestIniVersion(const wchar_t* ini, wchar_t* out, size_t cch)
             char c = buf[i];
             if (c == '\n') {
                 line[li] = 0;
-                // parse "[a.b.c.d]"
-                if (line[0] == '[') {
-                    int v[4]; int n = 0; char* p = line + 1;
-                    while (n < 4) {
-                        char* e = p; long val = 0; int digits = 0;
-                        while (*e >= '0' && *e <= '9') { val = val * 10 + (*e - '0'); e++; digits++; }
-                        if (!digits) break;
-                        v[n++] = (int)val;
-                        if (*e != '.') break;
-                        p = e + 1;
-                    }
-                    if (n == 4) {
-                        // section header must end right after the 4th number ("]" or "-SLInit]")
-                        char* after = line + 1;
-                        for (int k = 0; k < 4; k++) { while (*after >= '0' && *after <= '9') after++; if (k < 3) after++; }
-                        if (*after == ']' || *after == '-') {
-                            bool better = false;
-                            for (int k = 0; k < 4 && !better; k++) {
-                                if (v[k] > best[k]) better = true;
-                                if (v[k] < best[k]) break;
-                            }
-                            if (better) { memcpy(best, v, sizeof(v)); _snwprintf(out, cch, L"%d.%d.%d.%d", v[0], v[1], v[2], v[3]); }
-                        }
-                    }
-                }
+                ParseIniVersionLine(line, best, out, cch);
                 li = 0;
             } else if (li < 511) line[li++] = c;
         }
     }
+    // 文件末尾无换行时，最后一行也要参与解析
+    if (li > 0) { line[li] = 0; ParseIniVersionLine(line, best, out, cch); }
     CloseHandle(f);
 }
 
@@ -830,9 +899,10 @@ static void QueryStatus(StatusInfo& s)
     wcscpy(dll, sys); PathAppendW(dll, L"termsrv.dll");
     if (GetTermsrvVersion(dll, s.termsrv, 64)) {
         std::wstring ini = IniPath();
-        s.supported = PathFileExistsW(ini.c_str()) && IniHasSection(ini.c_str(), s.termsrv);
-        if (s.supported || PathFileExistsW(ini.c_str()))
+        if (PathFileExistsW(ini.c_str())) {
+            s.supported = IniHasSection(ini.c_str(), s.termsrv);
             LatestIniVersion(ini.c_str(), s.latest, 64);
+        }
     }
 
     SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
@@ -939,7 +1009,8 @@ static DWORD WINAPI StatusWorker(LPVOID)
 
 static void KickStatusRefresh()
 {
-    CloseHandle(CreateThread(NULL, 0, StatusWorker, NULL, 0, NULL));
+    HANDLE t = CreateThread(NULL, 0, StatusWorker, NULL, 0, NULL);
+    if (t) CloseHandle(t);   // CreateThread 失败时不关 NULL 句柄
 }
 
 
@@ -1023,12 +1094,14 @@ static DWORD WINAPI Worker(LPVOID p)
         break;
     case ID_BTN_SYNC:
         Log(L"========= 同步最新配置 =========");
-        if (DownloadIni((wchar_t*)IniPath().c_str(), true)) {
+        if (DownloadIni((wchar_t*)IniPath().c_str(), true, NULL)) {
             if (g_autoSupport) EnsureSupported(true);
             // SuperRDP2 workflow: 拉取线上最新配置后自动重装
+            // 注意必须走 update（卸载+重装）：菜单选项 1 在已安装时会被安装器早退，
+            // 新 ini 不会拷入 System32、服务不重启，配置不生效
             if (IsInstalled()) {
                 Log(L"[*] 检测到已安装，自动重新安装以应用新配置…");
-                RunInstaller(L"1");
+                RunInstaller(L"\n", L"update");
             } else {
                 Log(L"[*] 当前未安装，跳过自动重装（点击 安装 即可）");
             }
@@ -1041,8 +1114,8 @@ static DWORD WINAPI Worker(LPVOID p)
         Log(L"========= 更新 =========");
         if (DownloadIni((wchar_t*)IniPath().c_str(), true)) {
             if (g_autoSupport) EnsureSupported(true);
-            Log(L"[*] 重新应用配置（重新安装）…");
-            RunInstaller(L"1");
+            Log(L"[*] 重新应用配置（卸载+重新安装）…");
+            RunInstaller(L"\n", L"update");
         } else {
             Log(L"[-] 所有配置源均不可用，请检查网络");
         }
@@ -1087,15 +1160,26 @@ static void StartAction(int action)
 }
 
 // ---------------- silent mode (boot) ----------------
+static bool GetFileLastWrite(const std::wstring& path, FILETIME& ft)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fi;
+    if (!GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fi)) return false;
+    ft = fi.ftLastWriteTime;
+    return true;
+}
+
 static int SilentRun()
 {
     // allocated console for child stdio is not needed; run headless
-    // 1. sync, 2. autosupport, 3. if installed & config changed -> update
+    // 1. sync, 2. autosupport, 3. config changed/new version & installed -> update
     std::wstring ini = IniPath();
-    DownloadIni((wchar_t*)ini.c_str(), false);
+    bool iniChanged = false;
+    bool downloaded = DownloadIni((wchar_t*)ini.c_str(), false, &iniChanged);
+    // 与 GUI 同步路径一致：ini 更新后也要重装才能把新配置带进 System32 并重启服务。
+    // iniChanged 由 DownloadIni 内容级比较给出（不能用文件时间戳，代理可能剥离 Last-Modified）
     int st = EnsureSupported(false);
-    if (st == 1) {
-        // config extended -> refresh install quietly (console exe supports "update")
+    if (st == 1 || (iniChanged && IsInstalled())) {
+        // config extended / replaced -> refresh install quietly (console exe supports "update")
         // We must feed stdin for the trailing pause: use RunInstaller with extraArg.
         g_silent = true;
         RunInstaller(L"\n", L"update");
