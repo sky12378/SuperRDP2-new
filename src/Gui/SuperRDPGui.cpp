@@ -513,15 +513,55 @@ static std::wstring FindConsoleExe()
     return L"";
 }
 
+// ---------------- 子进程输出解码 ----------------
+// 控制台子进程（SuperRDP.exe 及其 system() 派生的 netsh）输出采用 OEM 码页
+// （中文 Windows = GBK）。此前按块「先猜 UTF-8 再退回 ACP」的启发式解码，
+// 一旦 GBK 双字节汉字被管道读边界劈开，就会产生「已删？？ 1 规则？？」
+// 之类的乱码。现固定按 OEM 码页解码，并把块尾未闭合的引导字节留到
+// 下一块拼接，避免多字节字符被截断。
+static UINT  ChildOutputCP() { UINT cp = GetOEMCP(); return cp ? cp : GetACP(); }
+static int   g_mbLeftLen = 0;              // 上一块遗留的未闭合引导字节数（0..1）
+static char  g_mbLeft[4];
+
+static void ResetChildDecoder()
+{
+    g_mbLeftLen = 0;
+}
+
 static void AppendToLogMB(const char* s, DWORD len)
 {
-    if (!len) return;
-    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, len, NULL, 0);
-    UINT cp = CP_UTF8;
-    if (n <= 0) { cp = CP_ACP; n = MultiByteToWideChar(cp, 0, s, len, NULL, 0); }
+    if (!len && !g_mbLeftLen) return;
+    // 拼接上一块遗留的半截多字节字符
+    char stack[4100];
+    std::vector<char> tmp;
+    char* p = stack;
+    DWORD total = (DWORD)g_mbLeftLen + len;
+    if (total > sizeof(stack)) {
+        tmp.resize(total);
+        p = tmp.data();
+    }
+    if (g_mbLeftLen) memcpy(p, g_mbLeft, g_mbLeftLen);
+    if (len) memcpy(p + g_mbLeftLen, s, len);
+    g_mbLeftLen = 0;
+
+    // 块尾若是 DBCS 引导字节，说明字符被读边界劈开：保留到下一块再解码
+    // （仅当本次确有新数据时才缓存；len==0 表示收尾 flush，直接解码残留字节）
+    UINT cp = ChildOutputCP();
+    CPINFO ci;
+    DWORD cont = total;
+    if (cont > 0 && len > 0 && GetCPInfo(cp, &ci) && ci.MaxCharSize > 1 && ci.LeadByte[0] != 0) {
+        if (IsDBCSLeadByteEx(cp, (BYTE)p[cont - 1])) {
+            g_mbLeft[0] = p[cont - 1];
+            g_mbLeftLen = 1;
+            cont--;
+        }
+    }
+    if (!cont) return;
+
+    int n = MultiByteToWideChar(cp, 0, p, (int)cont, NULL, 0);
     if (n <= 0) return;
     std::vector<wchar_t> w(n + 3);
-    MultiByteToWideChar(cp, 0, s, len, w.data(), n);
+    MultiByteToWideChar(cp, 0, p, (int)cont, w.data(), n);
     int end = n;
     if (n >= 1 && w[n - 1] == L'\n') { w[n - 1] = L'\r'; w[n] = L'\n'; end = n + 1; }
     else { w[n] = L'\r'; w[n + 1] = L'\n'; end = n + 2; }
@@ -606,6 +646,7 @@ static int RunInstaller(const wchar_t* option, const wchar_t* extraArg = NULL)
     }
 
     // poll pipe with timeout so we can feed "press any key" pauses and detect exit
+    ResetChildDecoder();   // 每次运行重新初始化输出解码状态（清掉跨块残留字节）
     char rbuf[4096];
     DWORD rd = 0, wr = 0;
     int quietMs = 0, nudges = 0;
@@ -651,6 +692,7 @@ static int RunInstaller(const wchar_t* option, const wchar_t* extraArg = NULL)
         if (GetTickCount() - drainStart >= 1000) break;
         Sleep(50);
     }
+    AppendToLogMB(NULL, 0);   // 冲刷解码器中可能残留的半截多字节字符
     DWORD code = 0; GetExitCodeProcess(pi.hProcess, &code);
     CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     CloseHandle(outR); CloseHandle(inW);
@@ -793,23 +835,36 @@ static bool BootEnabled()
     return on;
 }
 
-static void SetBoot(bool on)
+// 返回是否成功：失败时调用方需回滚 g_bootAuto，否则按钮 ✓ 状态与注册表不一致
+static bool SetBoot(bool on)
 {
     HKEY k;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\Windows\\CurrentVersion\\Run", 0, KEY_SET_VALUE, &k) != ERROR_SUCCESS) {
         Log(L"[-] 无法写入启动项（需要管理员权限）");
-        return;
+        return false;
     }
+    bool ok = true;
     if (on) {
         wchar_t p[MAX_PATH]; GetModuleFileNameW(NULL, p, MAX_PATH); p[MAX_PATH - 1] = 0;
         wchar_t v[MAX_PATH + 16]; _snwprintf(v, MAX_PATH + 16, L"\"%ls\" /silent", p); v[MAX_PATH + 15] = 0;
-        RegSetValueExW(k, L"SuperRDP", 0, REG_SZ, (LPBYTE)v, (DWORD)((wcslen(v) + 1) * sizeof(wchar_t)));
-        Log(L"[+] 已开启开机自动支持（静默同步+分析+更新）");
+        if (RegSetValueExW(k, L"SuperRDP", 0, REG_SZ, (LPBYTE)v, (DWORD)((wcslen(v) + 1) * sizeof(wchar_t))) != ERROR_SUCCESS) {
+            Log(L"[-] 写入启动项失败（需要管理员权限）");
+            ok = false;
+        } else {
+            Log(L"[+] 已开启开机自动支持（静默同步+分析+更新）");
+        }
     } else {
-        RegDeleteValueW(k, L"SuperRDP");
-        Log(L"[+] 已关闭开机自动支持");
+        LSTATUS st = RegDeleteValueW(k, L"SuperRDP");
+        // 值本来就不存在（ERROR_FILE_NOT_FOUND）也视为关闭成功
+        if (st != ERROR_SUCCESS && st != ERROR_FILE_NOT_FOUND) {
+            Log(L"[-] 删除启动项失败：%u", (unsigned)st);
+            ok = false;
+        } else {
+            Log(L"[+] 已关闭开机自动支持");
+        }
     }
     RegCloseKey(k);
+    return ok;
 }
 
 // ---------------- live status (replicates SuperRDP2 real-time check) ----------------
@@ -1003,7 +1058,9 @@ static DWORD WINAPI StatusWorker(LPVOID)
 {
     StatusInfo s;
     QueryStatus(s);
-    PostMessage(g_hWnd, WM_UPDATE_STATUS, 0, (LPARAM)new StatusInfo(s));
+    // 投递失败（消息队列满/窗口已销毁）时释放对象，防泄漏
+    StatusInfo* p = new StatusInfo(s);
+    if (!PostMessage(g_hWnd, WM_UPDATE_STATUS, 0, (LPARAM)p)) delete p;
     return 0;
 }
 
@@ -1178,7 +1235,9 @@ static int SilentRun()
     // 与 GUI 同步路径一致：ini 更新后也要重装才能把新配置带进 System32 并重启服务。
     // iniChanged 由 DownloadIni 内容级比较给出（不能用文件时间戳，代理可能剥离 Last-Modified）
     int st = EnsureSupported(false);
-    if (st == 1 || (iniChanged && IsInstalled())) {
+    // 必须带 downloaded 守卫：DownloadIni 入口保守设 changed=true，下载全部失败时
+    // 若不判 downloaded 会在无网络时每次开机都触发无意义的卸载+重装（断开 RDP 会话）
+    if (st == 1 || (downloaded && iniChanged && IsInstalled())) {
         // config extended / replaced -> refresh install quietly (console exe supports "update")
         // We must feed stdin for the trailing pause: use RunInstaller with extraArg.
         g_silent = true;
@@ -1215,9 +1274,11 @@ static int AnalyzeTestMode()
             std::string sl;
             if (CopySiblingSLInit(ini.c_str(), r.ver, sl)) {
                 HANDLE f = CreateFileW(ini.c_str(), FILE_APPEND_DATA, 0, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-                DWORD wr; WriteFile(f, sl.c_str(), (DWORD)sl.size(), &wr, NULL);
-                CloseHandle(f);
-                printf("cloned SLInit section (%zu bytes)\n", sl.size());
+                if (f != INVALID_HANDLE_VALUE) {
+                    DWORD wr; WriteFile(f, sl.c_str(), (DWORD)sl.size(), &wr, NULL);
+                    CloseHandle(f);
+                    printf("cloned SLInit section (%zu bytes)\n", sl.size());
+                } else printf("open ini for SLInit clone failed: %lu\n", GetLastError());
             } else printf("no sibling SLInit\n");
         }
     }
@@ -1364,7 +1425,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case ID_BTN_AUTOB:
             if (HIWORD(wp) == BN_CLICKED) {
                 g_bootAuto = !g_bootAuto;
-                SetBoot(g_bootAuto);
+                // 写注册表失败（如非管理员）时回滚开关状态，避免按钮 ✓ 与实际不符
+                if (!SetBoot(g_bootAuto)) g_bootAuto = !g_bootAuto;
                 KickStatusRefresh();
             }
             return 0;

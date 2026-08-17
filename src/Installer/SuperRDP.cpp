@@ -1060,14 +1060,6 @@ int wmain(int argc, wchar_t* argv[])
     wchar_t rdpwrap[MAX_PATH] = { 0 };
     bool update = false;
 
-    printf("--------------------------------------------------------\n");
-    printf("---------SuperRDP for Windows 10/11 Home version-----------\n");
-    printf("-------------Copyright (c) 2021 anhkgg.com--------------\n");
-    printf("-------------anhkgg | 公众号：汉客儿 -------------------\n");
-    printf("--------------------------------------------------------\n\n");
-
-    printf("--------------------------------------------------------\n\n");
-    
     printf("usage: SuperRDP.exe update\n");
     printf("\tupdate: uninstall old version and resintall new version\n\n");
 

@@ -2,6 +2,8 @@
 *.log
 *.bak
 *.autobak
+*.ini.new
+SuperRDP2-new-x64-*.zip
 
 # WorkBuddy internal memory / agent state (not project source)
 .workbuddy/
