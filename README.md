@@ -1,5 +1,7 @@
 # SuperRDP2-new
 
+**中文** | [English](README.en.md)
+
 解锁 Windows Home / 非 Pro 版本被阉割的**远程桌面（RDP）**功能 —— 基于 [anhkgg/SuperRDP](https://github.com/anhkgg/SuperRDP) 的重建工程，2026-08 维护版。
 
 > 项目地址：https://github.com/sky12378/SuperRDP2-new
