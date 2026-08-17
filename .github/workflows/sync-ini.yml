@@ -1,6 +1,7 @@
 name: Sync upstream rdpwrap.ini
 
 # 自动同步 bin/x64/rdpwrap.ini 与上游 sebaxakerhtc/rdpwrap.ini (master)
+# 当 ini 真有变化时，重新打包 v1.0 Release 的 zip 资产并覆盖上传
 # 触发：每天 08:00 北京时间（00:00 UTC）+ 手动 workflow_dispatch
 
 on:
@@ -10,6 +11,7 @@ on:
 
 permissions:
   contents: write          # 允许推回 main
+  actions: read            # 允许查询 workflow run
 
 concurrency:
   group: sync-ini
@@ -38,17 +40,36 @@ jobs:
           echo "::endgroup::"
 
       - name: Commit if changed
+        id: commit
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add bin/x64/rdpwrap.ini
           if git diff --cached --quiet; then
             echo "No changes, upstream already in sync."
+            echo "changed=false" >> $GITHUB_OUTPUT
           else
             git commit -m "chore(ini): sync rdpwrap.ini from upstream sebaxakerhtc/master
 
             Auto-sync by GitHub Actions.
             Source: https://github.com/sebaxakerhtc/rdpwrap.ini/blob/master/rdpwrap.ini"
             git push
+            echo "changed=true" >> $GITHUB_OUTPUT
             echo "::notice::Pushed upstream update"
           fi
+
+      - name: Repackage and update Release asset
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          cd bin/x64
+          # 1. 重新打包 zip（4 个文件）
+          rm -f SuperRDP2-new-x64-v1.0.zip
+          zip -r9 SuperRDP2-new-x64-v1.0.zip RDPWrap.dll rdpwrap.ini SuperRDP.exe SuperRDPGui.exe
+          ls -l SuperRDP2-new-x64-v1.0.zip
+          sha256sum SuperRDP2-new-x64-v1.0.zip
+          # 2. 覆盖上传到 v1.0 Release（--clobber 自动 DELETE 旧 asset + POST 新 asset）
+          gh release upload v1.0 SuperRDP2-new-x64-v1.0.zip --clobber --repo "$GITHUB_REPOSITORY"
+          echo "::notice::Release v1.0 asset updated with new ini"
