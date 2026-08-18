@@ -55,7 +55,6 @@
 #define ID_PANEL          1012   // big background container (overlaps children)
 #define ID_BTN_PLUS       1013
 #define ID_BTN_RESTART    1014   // (legacy worker action; no UI button in 1:1 layout)
-#define ID_BTN_STATUS     1015   // (legacy worker action; no UI button in 1:1 layout)
 // Static labels / values
 #define ID_LBL_SYSVER     1101
 #define ID_VAL_SYSVER     1102
@@ -311,7 +310,8 @@ static bool ReadWholeFile(const wchar_t* path, std::vector<BYTE>& out)
     HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
                            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     if (f == INVALID_HANDLE_VALUE) return false;
-    LARGE_INTEGER li; GetFileSizeEx(f, &li);
+    LARGE_INTEGER li = {0};   // 初始化，防 GetFileSizeEx 失败时垃圾值导致 bad_alloc 崩溃
+    if (!GetFileSizeEx(f, &li)) { CloseHandle(f); return false; }
     out.resize((SIZE_T)li.QuadPart);
     DWORD rd = 0;
     BOOL ok = out.empty() ? TRUE : ReadFile(f, out.data(), (DWORD)out.size(), &rd, NULL);
@@ -323,8 +323,9 @@ static bool AnalyzeTermsrv(AnalyzeResult& r)
 {
     memset(&r, 0, sizeof(r));
     wchar_t sys[MAX_PATH] = {0}, dll[MAX_PATH] = {0};
-    if (!GetSystemDirectoryW(sys, MAX_PATH)) return false;   // G6: 失败时避免对未初始化缓冲操作
-    wcscpy(dll, sys); PathAppendW(dll, L"termsrv.dll");
+    DWORD sysLen = GetSystemDirectoryW(sys, MAX_PATH);
+    if (sysLen == 0 || sysLen >= MAX_PATH) return false;   // 失败或截断时跳过，防后续 wcscpy+PathAppendW 溢出
+    wcscpy_s(dll, MAX_PATH, sys); PathAppendW(dll, L"termsrv.dll");
 
     if (!GetTermsrvVersion(dll, r.ver, 64)) return false;
 
@@ -539,7 +540,7 @@ static bool DownloadIni(const wchar_t* dest, bool verbose, bool* changed = NULL)
             if (verbose) Log(L"[*] config unchanged, skip replace");
             return true;
         }
-        if (!MoveFileW(tmp, dest)) { if (verbose) Log(L"[-] replace config failed: %u", GetLastError()); return false; }
+        if (!MoveFileW(tmp, dest)) { if (verbose) Log(L"[-] replace config failed: %u", GetLastError()); DeleteFileW(tmp); return false; }
         if (verbose) Log(L"[+] config synced (%.0f KB)", (double)buf.size() / 1024.0);
         return true;
     }
@@ -709,7 +710,10 @@ static int RunInstaller(const wchar_t* option, const wchar_t* extraArg = NULL)
                 WideCharToMultiByte(CP_ACP, 0, option, wlen, pBuf, mbLen, NULL, NULL);
                 pBuf[mbLen] = '\n';
                 DWORD wr;
-                WriteFile(inW, pBuf, mbLen + kExtraLF, &wr, NULL);
+                // 管道可能已断裂（子进程提前退出），检查返回值避免静默失败无从排查
+                if (!WriteFile(inW, pBuf, mbLen + kExtraLF, &wr, NULL) || wr != (DWORD)(mbLen + kExtraLF)) {
+                    Log(L"[!] 写入子进程 stdin 失败（可能已退出）");
+                }
                 delete[] pBuf;
             }
         }
@@ -734,7 +738,10 @@ static int RunInstaller(const wchar_t* option, const wchar_t* extraArg = NULL)
             // installer idle 1.5s -> feed newline (scanf leftovers / pause prompt)
             if (quietMs >= 1500) {
                 quietMs = 0;
-                WriteFile(inW, "\n", 1, &wr, NULL);
+                if (!WriteFile(inW, "\n", 1, &wr, NULL) || wr != 1) {
+                    // 管道断裂：子进程已退出，nudge 无意义，跳出轮询
+                    break;
+                }
                 FlushFileBuffers(inW);
                 nudges++;
             }
@@ -1054,8 +1061,9 @@ static void QueryStatus(StatusInfo& s)
     QueryOSVersion(s.osver, 64);
 
     wchar_t sys[MAX_PATH] = {0}, dll[MAX_PATH] = {0};
-    if (GetSystemDirectoryW(sys, MAX_PATH)) {   // G6: 失败时跳过 termsrv 版本/支持性检查
-        wcscpy(dll, sys); PathAppendW(dll, L"termsrv.dll");
+    DWORD sysLen = GetSystemDirectoryW(sys, MAX_PATH);
+    if (sysLen > 0 && sysLen < MAX_PATH) {   // 失败或截断时跳过 termsrv 版本/支持性检查
+        wcscpy_s(dll, MAX_PATH, sys); PathAppendW(dll, L"termsrv.dll");
         if (GetTermsrvVersion(dll, s.termsrv, 64)) {
             std::wstring ini = IniPath();
             if (PathFileExistsW(ini.c_str())) {
@@ -1080,17 +1088,20 @@ static void QueryStatus(StatusInfo& s)
     // 3389 listener probe (200ms timeout)
     SOCKET so = socket(AF_INET, SOCK_STREAM, 0);
     if (so != INVALID_SOCKET) {
-        u_long nb = 1; ioctlsocket(so, FIONBIO, &nb);
-        struct sockaddr_in sa = {0};
-        sa.sin_family = AF_INET; sa.sin_port = htons(3389);
-        sa.sin_addr.s_addr = htonl(0x7F000001);
-        connect(so, (struct sockaddr*)&sa, sizeof(sa));
-        fd_set w; FD_ZERO(&w); FD_SET(so, &w);
-        struct timeval tv = {0, 200000};
-        if (select(0, NULL, &w, NULL, &tv) > 0) {
-            int err = 0; int len = sizeof(err);
-            getsockopt(so, SOL_SOCKET, SO_ERROR, (char*)&err, &len);
-            s.listening = (err == 0);
+        u_long nb = 1;
+        // 仅在成功设为非阻塞后才 connect，否则阻塞 connect 会卡住状态线程 ~21 秒
+        if (ioctlsocket(so, FIONBIO, &nb) == 0) {
+            struct sockaddr_in sa = {0};
+            sa.sin_family = AF_INET; sa.sin_port = htons(3389);
+            sa.sin_addr.s_addr = htonl(0x7F000001);
+            connect(so, (struct sockaddr*)&sa, sizeof(sa));
+            fd_set w; FD_ZERO(&w); FD_SET(so, &w);
+            struct timeval tv = {0, 200000};
+            if (select(0, NULL, &w, NULL, &tv) > 0) {
+                int err = 0; int len = sizeof(err);
+                getsockopt(so, SOL_SOCKET, SO_ERROR, (char*)&err, &len);
+                s.listening = (err == 0);
+            }
         }
         closesocket(so);
     }
@@ -1184,39 +1195,6 @@ static void KickStatusRefresh()
 {
     HANDLE t = CreateThread(NULL, 0, StatusWorker, NULL, 0, NULL);
     if (t) CloseHandle(t);   // CreateThread 失败时不关 NULL 句柄
-}
-
-
-
-static void DoStatus()
-{
-    Log(L"========= 状态检查 =========");
-    wchar_t sys[MAX_PATH] = {0}, dll[MAX_PATH] = {0};
-    if (GetSystemDirectoryW(sys, MAX_PATH)) {   // G6: 失败时 dll 保持空路径，后续检查报缺失
-        wcscpy(dll, sys); PathAppendW(dll, L"termsrv.dll");
-    }
-    wchar_t ver[64] = L"?";
-    GetTermsrvVersion(dll, ver, 64);
-    Log(L"termsrv.dll: %ls  (%s)", ver, PathFileExistsW(dll) ? L"存在" : L"缺失");
-
-    std::wstring ini = IniPath();
-    if (PathFileExistsW(ini.c_str()))
-        Log(L"rdpwrap.ini: %ls  本版本支持: %s", ini.c_str(),
-            IniHasSection(ini.c_str(), ver) ? L"是" : L"否（可勾选自动分析后安装）");
-    else
-        Log(L"rdpwrap.ini: 未找到，请先点击 同步最新配置");
-
-    HKEY k;
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Services\\TermService\\Parameters", 0, KEY_READ, &k) == ERROR_SUCCESS) {
-        wchar_t v[MAX_PATH] = {0}; DWORD sz = sizeof(v); DWORD t;
-        if (RegQueryValueExW(k, L"ServiceDll", 0, &t, (LPBYTE)v, &sz) == ERROR_SUCCESS) {
-            v[MAX_PATH - 1] = 0;   // G4: 强制收尾
-            Log(L"TermService ServiceDll: %ls", v);
-        }
-        RegCloseKey(k);
-    }
-    Log(L"开机自动支持: %s", BootEnabled() ? L"已开启" : L"未开启");
-    Log(L"===========================");
 }
 
 // ---------------- service start / stop (启动 / 停止) ----------------
@@ -1338,9 +1316,6 @@ static DWORD WINAPI Worker(LPVOID p)
         if (ControlTermService(false)) Log(L"[+] TermService 已停止");
         else Log(L"[-] 停止失败（需要管理员权限）");
         Log(L"=============================");
-        break;
-    case ID_BTN_STATUS:
-        DoStatus();
         break;
     }
     PostMessage(g_hWnd, WM_WORKER_DONE, 0, 0);
@@ -1510,6 +1485,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             (LPARAM)(g_autoSupport ? L"自动分析 ✓" : L"自动分析"));
         SendDlgItemMessageW(hwnd, ID_BTN_AUTOB, WM_SETTEXT, 0,
             (LPARAM)(g_bootAuto ? L"开机启动 ✓" : L"开机启动"));
+
+        // "+" 按钮实为「强制重启终端服务」，加 tooltip 提示提升可发现性（仅悬停提示，点击行为不变）
+        HWND hTip = CreateWindowExW(0, TOOLTIPS_CLASSW, NULL, WS_POPUP | TTS_ALWAYSTIP,
+            CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+            hwnd, NULL, NULL, NULL);
+        if (hTip) {
+            HWND hPlus = GetDlgItem(hwnd, ID_BTN_PLUS);
+            RECT rc;
+            if (hPlus && GetWindowRect(hPlus, &rc)) {
+                MapWindowPoints(NULL, hwnd, (LPPOINT)&rc, 2);
+                TOOLINFOW ti = {0};
+                ti.cbSize = sizeof(ti);
+                ti.uFlags = TTF_SUBCLASS;
+                ti.hwnd = hwnd;
+                ti.uId = (UINT_PTR)hPlus;
+                ti.rect = rc;
+                ti.lpszText = (LPWSTR)L"强制重启终端服务";
+                SendMessageW(hTip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+            }
+        }
 
         // log file 初始化已前移到 wWinMain 入口（/silent 开机运行不创建窗口，
         // 若只在 WM_CREATE 初始化，静默流程将全程无日志）
