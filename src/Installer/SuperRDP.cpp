@@ -260,6 +260,16 @@ bool CheckTermsrvVersion(wchar_t *IniPath)
         delete IniFile;
         IniFile = NULL;
     }
+
+    // INI_FILE 构造函数在文件打开/读取失败时静默返回（SectionCount=0），
+    // 导致后续 SectionExists 返回 false 时误报 "version not supported"。
+    // 先检查文件是否存在且可读，给出准确的加载失败提示。
+    DWORD attr = GetFileAttributesW(IniPath);
+    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+        printf("[-] Failed to load configuration: INI file not found or inaccessible.\r\n");
+        return false;
+    }
+
     IniFile = new (std::nothrow) INI_FILE(IniPath);
     FILE_VERSION _FileVersion = { 0 };
     wchar_t termsrv[MAX_PATH] = { 0 };
@@ -300,10 +310,18 @@ bool TSConfigFirewall(bool Enable)
 {
     int ret;
     if (Enable) {
+        // 规则名 "Remote Desktop" 为硬编码（原始设计，卸载按名删除不可改名）：
+        // 先删既有同名规则（结果忽略），避免重复安装累积重复规则
+        system("netsh advfirewall firewall delete rule name=\"Remote Desktop\"");
         ret = system("netsh advfirewall firewall add rule name=\"Remote Desktop\" dir=in protocol=tcp localport=3389 profile=any action=allow");
     }
     else {
+        // 卸载时删除规则：规则不存在（非零返回）不算失败，卸载应为幂等
         ret = system("netsh advfirewall firewall delete rule name=\"Remote Desktop\"");
+        if (ret != 0) {
+            printf("[*] Firewall rule not found or already removed (code %d).\n", ret);
+            return true;
+        }
     }
     if (ret != 0) {
         printf("[-] netsh firewall config failed (code %d).\n", ret);
@@ -312,25 +330,6 @@ bool TSConfigFirewall(bool Enable)
     return true;
 }
 
-bool EnableDebugPrivilege()
-{
-    HANDLE hToken;
-    if (OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES, &hToken))
-    {
-        LUID luid;
-        LookupPrivilegeValue(NULL, SE_DEBUG_NAME, &luid);
-        TOKEN_PRIVILEGES tp;
-        tp.PrivilegeCount = 1;
-        tp.Privileges[0].Luid = luid;
-        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-        AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), NULL, NULL);
-        // AdjustTokenPrivileges 可能返回 TRUE 但实际未全部授予，需再查 GetLastError
-        bool ok = (GetLastError() == ERROR_SUCCESS);
-        CloseHandle(hToken);
-        return ok;
-    }
-    return FALSE;
-}
 //
 //void KillProcess(DWORD pid)
 //{
@@ -380,52 +379,51 @@ bool TSConfigRegistry(bool Enable)
             reg.Close();
         }
 
-        CRegistry reg1;
-        
-        if (!reg1.Open(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\AddIns", KEY_READ | (Arch == 64 ? KEY_WOW64_64KEY : 0))) {
+        // 原实现以 AddIns 父键存在性决定是否创建全部子键：父键存在即跳过，
+        // 导致子键缺失或 Name/Type 错误时不会被修复。
+        // 改为始终逐个 CreateKey（RegCreateKeyEx 对已存在的键等效于打开），确保每个子键的值都被正确写入。
 
-            if (!reg.CreateKey(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\AddIns", KEY_WRITE | (Arch == 64 ? KEY_WOW64_64KEY : 0))) {
-                printf("[-] OpenKey error\n");
-                return false;
-            }
-            reg.Close();
+        if (!reg.CreateKey(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\AddIns", KEY_WRITE | (Arch == 64 ? KEY_WOW64_64KEY : 0))) {
+            printf("[-] OpenKey error\n");
+            return false;
+        }
+        reg.Close();
 
-            if (!reg.CreateKey(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\AddIns\\Clip Redirector", KEY_WRITE | (Arch == 64 ? KEY_WOW64_64KEY : 0))) {
-                printf("[-] OpenKey error\n");
-                return false;
-            }
-            if (!reg.Write(L"Name", L"RDPClip")) {
-                printf("[-] writekey error\n");
-                return false;
-            }
-            if (!reg.Write(L"Type", 3)) {
-                printf("[-] writekey error\n");
-                return false;
-            }
-            reg.Close();
+        if (!reg.CreateKey(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\AddIns\\Clip Redirector", KEY_WRITE | (Arch == 64 ? KEY_WOW64_64KEY : 0))) {
+            printf("[-] OpenKey error\n");
+            return false;
+        }
+        if (!reg.Write(L"Name", L"RDPClip")) {
+            printf("[-] writekey error\n");
+            return false;
+        }
+        if (!reg.Write(L"Type", 3)) {
+            printf("[-] writekey error\n");
+            return false;
+        }
+        reg.Close();
 
-            if (!reg.CreateKey(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\AddIns\\DND Redirector", KEY_WRITE | (Arch == 64 ? KEY_WOW64_64KEY : 0))) {
-                printf("[-] OpenKey error\n");
-                return false;
-            }
-            if (!reg.Write(L"Name", L"RDPDND")) {
-                printf("[-] writekey error\n");
-                return false;
-            }
-            if (!reg.Write(L"Type", 3)) {
-                printf("[-] writekey error\n");
-                return false;
-            }
-            reg.Close();
+        if (!reg.CreateKey(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\AddIns\\DND Redirector", KEY_WRITE | (Arch == 64 ? KEY_WOW64_64KEY : 0))) {
+            printf("[-] OpenKey error\n");
+            return false;
+        }
+        if (!reg.Write(L"Name", L"RDPDND")) {
+            printf("[-] writekey error\n");
+            return false;
+        }
+        if (!reg.Write(L"Type", 3)) {
+            printf("[-] writekey error\n");
+            return false;
+        }
+        reg.Close();
 
-            if (!reg.CreateKey(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\AddIns\\Dynamic VC", KEY_WRITE | (Arch == 64 ? KEY_WOW64_64KEY : 0))) {
-                printf("[-] OpenKey error\n");
-                return false;
-            }
-            if (!reg.Write(L"Type", -1)) {
-                printf("[-] writekey error\n");
-                return false;
-            }
+        if (!reg.CreateKey(HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Terminal Server\\AddIns\\Dynamic VC", KEY_WRITE | (Arch == 64 ? KEY_WOW64_64KEY : 0))) {
+            printf("[-] OpenKey error\n");
+            return false;
+        }
+        if (!reg.Write(L"Type", -1)) {
+            printf("[-] writekey error\n");
+            return false;
         }
     }
 
@@ -464,13 +462,21 @@ bool SvcStart(wchar_t* SvcName)
                     QueryServiceStatus(hSvc, &st) &&
                     (st.dwCurrentState == SERVICE_RUNNING);
                 if (!running) {
-                    printf("[*] Start service faild.%d\n", err);
+                    printf("[*] Start service failed. %d\n", err);
                     goto __exit;
                 }
             }
         }
+        else if (err == 1062 /* ERROR_SERVICE_NOT_ACTIVE，MinGW 头文件未定义该宏 */) {
+            // 刚终止过服务进程时 SCM 可能尚未同步停止状态，稍候重试一次
+            Sleep(2000);
+            if (!StartService(hSvc, 0, NULL)) {
+                printf("[*] Start service failed. %d\n", GetLastError());
+                goto __exit;
+            }
+        }
         else {
-            printf("[*] Start service faild.%d\n", err);
+            printf("[*] Start service failed. %d\n", err);
             // 原实现落空到 ret = true，把启动失败误报为成功，必须走失败路径
             goto __exit;
         }
@@ -528,7 +534,7 @@ int SvcGetStart(const wchar_t* SvcName)
     SC_HANDLE hSvc = NULL;
     DWORD pcbBytesNeeded = 0;
     QUERY_SERVICE_CONFIG* Buf = NULL;
-    int ret = 0;
+    int ret = -1;   // 失败时返回 -1，避免与 SERVICE_BOOT_START(0) 混淆
 
     hSc = OpenSCManager(NULL, SERVICES_ACTIVE_DATABASE, SC_MANAGER_CONNECT);
     if (hSc == NULL) {
@@ -571,7 +577,7 @@ __exit:
         CloseServiceHandle(hSvc);
     }
     if (Buf) {
-        delete[] Buf;
+        delete[] (char*)Buf;   // 以 new char[] 分配，必须以 char* 释放，匹配元素类型
     }
 
     return ret;
@@ -580,7 +586,6 @@ __exit:
 void CheckTermsrvProcess()
 {
     SC_HANDLE hSc = NULL;
-    SC_HANDLE hSvc = NULL;
     DWORD BytesNeeded = 0;
     DWORD ServicesReturned = 0;
     DWORD ResumeHandle = 0;
@@ -602,8 +607,8 @@ __again:
         printf("OpenSCManager error : %d\n", GetLastError());
         goto  __exit;
     }
-   
-    if (!EnumServicesStatusEx(hSc,
+
+    if (EnumServicesStatusEx(hSc,
         SC_ENUM_PROCESS_INFO,
         SERVICE_WIN32,
         SERVICE_STATE_ALL,
@@ -613,87 +618,94 @@ __again:
         &ServicesReturned,
         &ResumeHandle,
         NULL)) {
-        if (GetLastError() != ERROR_MORE_DATA) {
-            printf("EnumServicesStatusEx error : %d\n", GetLastError());
-            goto __exit;
-        }
+        // 正常应以 ERROR_MORE_DATA 失败并返回所需缓冲大小；返回 TRUE 仅在服务表为空时可能，给出明确提示
+        printf("[-] EnumServicesStatusEx returned no data.\n");
+        goto __exit;
+    }
 
-        Services = (ENUM_SERVICE_STATUS_PROCESS *)new (std::nothrow) char[BytesNeeded];
-        if (Services == NULL) {
-            printf("new error : %d\n", GetLastError());
-            goto __exit;
-        }
+    if (GetLastError() != ERROR_MORE_DATA) {
+        printf("EnumServicesStatusEx error : %d\n", GetLastError());
+        goto __exit;
+    }
 
-        if (!EnumServicesStatusEx(hSc,
-            SC_ENUM_PROCESS_INFO,
-            SERVICE_WIN32,
-            SERVICE_STATE_ALL,
-            (LPBYTE)Services,
-            BytesNeeded,
-            &BytesNeeded,
-            &ServicesReturned,
-            &ResumeHandle,
-            NULL)) {
-            printf("EnumServicesStatusEx error : %d\n", GetLastError());
-            goto __exit;
-        }
+    Services = (ENUM_SERVICE_STATUS_PROCESS *)new (std::nothrow) char[BytesNeeded];
+    if (Services == NULL) {
+        printf("no memory\n");
+        goto __exit;
+    }
 
-        //TermService
-        for (i = 0; i < ServicesReturned; i++) {
-            if (!_wcsicmp(Services[i].lpServiceName, TermService)) {
-                TermServicePID = Services[i].ServiceStatusProcess.dwProcessId;
-                found = true;
-                break;
-            }
-        }
+    if (!EnumServicesStatusEx(hSc,
+        SC_ENUM_PROCESS_INFO,
+        SERVICE_WIN32,
+        SERVICE_STATE_ALL,
+        (LPBYTE)Services,
+        BytesNeeded,
+        &BytesNeeded,
+        &ServicesReturned,
+        &ResumeHandle,
+        NULL)) {
+        printf("EnumServicesStatusEx error : %d\n", GetLastError());
+        goto __exit;
+    }
 
-        if (!found) {
-            printf("[-] TermService not found.\n");
-            goto __exit;
+    //TermService
+    for (i = 0; i < ServicesReturned; i++) {
+        if (!_wcsicmp(Services[i].lpServiceName, TermService)) {
+            TermServicePID = Services[i].ServiceStatusProcess.dwProcessId;
+            found = true;
+            break;
         }
+    }
 
-        if (TermServicePID != 0) {
+    if (!found) {
+        printf("[-] TermService not found.\n");
+        goto __exit;
+    }
+
+    if (TermServicePID != 0) {
+        again = false;
+        printf("[+] TermService found pid: %d\n", TermServicePID);
+    }
+    else {
+        if (Started) {
+            printf("Failed to set up TermService. Unknown error.\n");
+            getchar();
             again = false;
-            printf("[+] TermService found pid: %d\n", TermServicePID);
+            goto __exit;
+        }
+        // 原实现无重试上限：SvcStart 失败时 Started 保持 false，
+        // again=true 反复跳回 __again，构成无限循环
+        if (++retry > 3) {
+            printf("[-] Failed to start TermService after %d retries.\n", retry - 1);
+            again = false;
+            goto __exit;
+        }
+        SvcConfigStart(TermService, SERVICE_AUTO_START);
+        if (SvcStart(TermService)) {
+            Started = true;
         }
         else {
-            if (Started) {
-                printf("Failed to set up TermService. Unknown error.\n");
-                getchar();
-                again = false;
-                goto __exit;
-            }
-            // 原实现无重试上限：SvcStart 失败时 Started 保持 false，
-            // again=true 反复跳回 __again，构成无限循环
-            if (++retry > 3) {
-                printf("[-] Failed to start TermService after %d retries.\n", retry - 1);
-                again = false;
-                goto __exit;
-            }
-            SvcConfigStart(TermService, SERVICE_AUTO_START);
-            if (SvcStart(TermService)) {
-                Started = true;
-            }
-            else {
-                printf("Start TermService failed!\n");
-            }
-            
-            again = true;
-            goto __exit;
+            printf("Start TermService failed!\n");
         }
 
-        for (i = 0; i < ServicesReturned; i++) {
-            if (Services[i].lpServiceName) {
-                if (Services[i].ServiceStatusProcess.dwProcessId == TermServicePID) {
-                    if (_wcsicmp(Services[i].lpServiceName, TermService)) {
-                        // 数组大小 100，索引达到 100 即越界，必须 >= 判断
-                        if (ShareSvcCount >= 100) {
-                            printf("ShareSvcCount = %d\n", ShareSvcCount);
-                            break;
-                        }
-                        StrCpy(ShareSvc[ShareSvcCount++], Services[i].lpServiceName);
-                        printf("[*] Shared services found: %ws\n", Services[i].lpServiceName);
+        // StartService 返回时服务可能仍处于 START_PENDING，dwProcessId 尚未就绪；
+        // 必须等待服务过渡到 RUNNING 再重枚举，否则下一轮 PID=0 会直接报 "Unknown error" 放弃
+        Sleep(2000);
+        again = true;
+        goto __exit;
+    }
+
+    for (i = 0; i < ServicesReturned; i++) {
+        if (Services[i].lpServiceName) {
+            if (Services[i].ServiceStatusProcess.dwProcessId == TermServicePID) {
+                if (_wcsicmp(Services[i].lpServiceName, TermService)) {
+                    // 数组大小 100，索引达到 100 即越界，必须 >= 判断
+                    if (ShareSvcCount >= 100) {
+                        printf("ShareSvcCount = %d\n", ShareSvcCount);
+                        break;
                     }
+                    StringCchCopyW(ShareSvc[ShareSvcCount++], MAX_PATH, Services[i].lpServiceName);
+                    printf("[*] Shared services found: %ws\n", Services[i].lpServiceName);
                 }
             }
         }
@@ -701,14 +713,11 @@ __again:
 
 __exit:
     if (Services) {
-        delete[] Services;
+        delete[] (char*)Services;   // 以 new char[] 分配，必须以 char* 释放，匹配元素类型
         Services = NULL;
     }
     if (hSc) {
         CloseServiceHandle(hSc);
-    }
-    if (hSvc) {
-        CloseServiceHandle(hSvc);
     }
 
     if (again) {
@@ -752,13 +761,23 @@ bool KillProcess(DWORD pid)
 {
     bool ret = false;
 
-    HANDLE hProc = OpenProcess(PROCESS_TERMINATE, FALSE, pid);
+    // SYNCHRONIZE 用于终止后等待进程真正退出
+    HANDLE hProc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
     if (hProc) {
         if (!TerminateProcess(hProc, 0)) {
             printf("[-] TerminateProcess error (code %d).\n", GetLastError());
         }
         else {
-            ret = true;
+            // TerminateProcess 是异步的，等待进程实际退出，
+            // 避免后续文件删除/覆盖及 StartService 出现竞态（如 1062）
+            DWORD waitResult = WaitForSingleObject(hProc, 10000);
+            if (waitResult == WAIT_OBJECT_0) {
+                ret = true;
+            }
+            else {
+                // 超时或失败：进程可能仍存活，后续文件操作可能失败
+                printf("[-] Process did not exit within timeout (wait result %d).\n", waitResult);
+            }
         }
         CloseHandle(hProc);
     }
@@ -801,20 +820,25 @@ int ReleaseFile(LPCTSTR path, LPCTSTR res_type, WORD res_id)
     // 写入文件：hG 仅是资源句柄，必须 LockResource 取真实数据指针，否则写出的是指针值/越界内存
     LPVOID pResData = LockResource(hG);
     if (pResData == NULL) {
+        DWORD err = GetLastError();
         CloseHandle(hFile);
-        return GetLastError();
+        DeleteFile(path);   // 不留空壳文件，否则下次 PathFileExists 命中会跳过释放，损坏态永久残留
+        return err;
     }
     DWORD dwWrite = 0;
     if (!WriteFile(hFile, pResData, dwSize, &dwWrite, NULL) || dwWrite != dwSize) {
         // 部分写入也会落盘残缺 dll，必须报错而非返回成功
         DWORD err = GetLastError();
         CloseHandle(hFile);
+        DeleteFile(path);   // 不留残缺文件，否则下次 PathFileExists 命中会跳过释放，损坏态永久残留
         return err != ERROR_SUCCESS ? err : ERROR_WRITE_FAULT;
     }
     CloseHandle(hFile);
 
     return ERROR_SUCCESS;
 }
+
+bool AddPrivilege(const wchar_t* SePriv);
 
 bool InstallWrapper(wchar_t* wrapper)
 {
@@ -825,6 +849,7 @@ bool InstallWrapper(wchar_t* wrapper)
     int ret = 0;
     bool ok = true;
     bool done = false;   // 是否走到末尾输出阶段（早期 goto 失败路径不算成功）
+    DWORD sysDirLen = 0;  // 必须在首个 goto __exit 之前声明，避免 goto 跨越初始化
 
     if (Installed) {
         printf("[*] RDP Wrapper Library is already installed.\n");
@@ -864,9 +889,27 @@ bool InstallWrapper(wchar_t* wrapper)
         goto __exit;
     }
 
+    // 必须先终止服务进程再复制文件：更新流程中若旧 rdpwrap.dll 仍被服务进程加载，
+    // CopyFileW 会遭遇 ERROR_SHARING_VIOLATION。先杀进程释放文件占用。
+    printf("[*] Terminating service...\n");
+    if (!AddPrivilege(L"SeDebugPrivilege")) {
+        printf("[!] Enable SeDebugPrivilege failed, terminating service may fail.\n");
+    }
+
+    if (!KillProcess(TermServicePID)) {
+        goto __exit;
+    }
+
+    Sleep(1000);
+
     printf("[*] Configuring service library...\n");
 
-    GetSystemDirectoryW(rfxvmt, MAX_PATH);
+    // 必须校验返回值：返回 0 为失败；返回 >= MAX_PATH 表示缓冲不足（截断），后续 PathAppendW 会溢出
+    sysDirLen = GetSystemDirectoryW(rfxvmt, MAX_PATH);
+    if (sysDirLen == 0 || sysDirLen >= MAX_PATH) {
+        printf("[-] GetSystemDirectory failed or path too long (code %d)\n", GetLastError());
+        goto __exit;
+    }
     wcscpy_s(rdpwrap, rfxvmt);
     wcscpy_s(dstini, rfxvmt);
     PathAppendW(rdpwrap, L"rdpwrap.dll");
@@ -899,15 +942,6 @@ bool InstallWrapper(wchar_t* wrapper)
 
     printf("[*] Checking dependencies...\n");
     CheckTermsrvDependencies();
-
-    printf("[*] Terminating service...\n");
-    EnableDebugPrivilege();
-
-    if (!KillProcess(TermServicePID)) {
-        goto __exit;
-    }
-
-    Sleep(1000);
 
     for (int i = 0; i < ShareSvcCount; i++) {
         SvcStart(ShareSvc[i]);
@@ -1039,6 +1073,7 @@ void DeleteFiles()
 bool UninstallWrapper()
 {
     bool result = false;
+    bool ok = true;   // 聚合服务重启/注册表/防火墙等后续步骤结果，必须声明在首个 goto 之前
     CRegistry reg;
 
     if (!Installed) {
@@ -1063,7 +1098,7 @@ bool UninstallWrapper()
     }
 
     if (!reg.WriteExpandSZ(TEXT("ServiceDll"), L"%SystemRoot%\\System32\\termsrv.dll")) {
-        printf("[-] read error (code %d).\n", GetLastError());
+        printf("[-] write error (code %d).\n", GetLastError());
         goto __exit;
     }
 
@@ -1071,11 +1106,16 @@ bool UninstallWrapper()
 
     AddPrivilege(L"SeDebugPrivilege");
 
-    if (!KillProcess(TermServicePID)) {
-        goto __exit;
+    // 服务未运行（PID=0）时无需终止；否则 OpenProcess(0) 必然失败导致整个卸载中止，文件无法删除
+    if (TermServicePID != 0) {
+        if (!KillProcess(TermServicePID)) {
+            goto __exit;
+        }
+        Sleep(1000);
     }
-
-    Sleep(1000);
+    else {
+        printf("[*] TermService is not running, skip terminating.\n");
+    }
 
     printf("[*] Removing files...\n");
 
@@ -1086,15 +1126,23 @@ bool UninstallWrapper()
     }
 
     Sleep(500);
-    SvcStart(TermService);
+    // 原实现忽略以下全部步骤的返回值，存在假成功；与安装流程一致进行聚合
+    if (!SvcStart(TermService)) {
+        printf("[-] TermService restart failed, please restart it manually.\n");
+        ok = false;
+    }
     Sleep(500);
 
     printf("[*] Configuring registry...\n");
-    TSConfigRegistry(FALSE);
+    if (!TSConfigRegistry(FALSE)) {
+        ok = false;
+    }
     printf("[*] Configuring firewall...\n");
-    TSConfigFirewall(FALSE);
+    if (!TSConfigFirewall(FALSE)) {
+        ok = false;
+    }
 
-    result = true;
+    result = ok;
 
 __exit:
     reg.Close();
@@ -1114,25 +1162,39 @@ __exit:
     return result;
 }
 
-void ForceRestartTerminalService()
+bool ForceRestartTerminalService()
 {
+    bool ok = true;
+
     printf("[*] Restarting...\n");
 
     CheckTermsrvProcess();
 
     printf("[*] Terminating service...\n");
     AddPrivilege(L"SeDebugPrivilege");
-    KillProcess(TermServicePID);
-    Sleep(1000);
+    // 服务未运行时跳过终止，避免 OpenProcess(0) 报错刷屏
+    if (TermServicePID != 0) {
+        KillProcess(TermServicePID);
+        Sleep(1000);
+    }
+    else {
+        printf("[*] TermService is not running.\n");
+    }
 
     for (int i = 0; i < ShareSvcCount; i++) {
         SvcStart(ShareSvc[i]);
     }
 
     Sleep(500);
-    SvcStart(TermService);
+    if (!SvcStart(TermService)) {
+        printf("[-] TermService restart failed, please restart it manually.\n");
+        ok = false;
+    }
 
-    printf("[+] Done.\n");
+    if (ok) {
+        printf("[+] Done.\n");
+    }
+    return ok;
 }
 
 
@@ -1205,7 +1267,7 @@ int wmain(int argc, wchar_t* argv[])
 
     printf("> ");
     fflush(stdin);//清除输入（标准上对输入流 fflush 是 UB，Windows 控制台实现有效）
-    option[0] = L'\0';
+    option[0] = '\0';
     scanf("%1s", option);
 
     if (option[0] == '1') {
@@ -1228,8 +1290,7 @@ int wmain(int argc, wchar_t* argv[])
     }
     else if (option[0] == '3') {
         printf("[+] Select option 3, force restart services...\n");
-        ForceRestartTerminalService();
-        exitCode = 0;
+        exitCode = ForceRestartTerminalService() ? 0 : 1;
     }
     else {
         printf("Invalid option.\n");

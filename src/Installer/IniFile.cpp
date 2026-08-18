@@ -48,7 +48,8 @@ INI_FILE::INI_FILE(wchar_t *FilePath)
 
 	FileRaw = new char[FileSize];
 	Status = ReadFile(hFile, FileRaw, FileSize, &NumberOfBytesRead, NULL);
-	if (!Status)
+	// 短读会使 FileRaw 尾部为未初始化内存并参与后续解析，必须要求完整读取
+	if (!Status || NumberOfBytesRead != FileSize)
 	{
 		CloseHandle(hFile);   // 防句柄泄漏
 		return;
@@ -286,8 +287,11 @@ bool INI_FILE::Parse()
 		{
 			CurrentSectionNum++;
 			CurrentVariableNum = 0;
+			// 节名长度必须受限：行最长可达 511 字节，直接拷贝会溢出 SectionName[255] 破坏堆内存
+			DWORD NameLen = CurrentStringSize - 2;
+			if (NameLen > MAX_STRING_LEN - 1) NameLen = MAX_STRING_LEN - 1;
 			memset(IniData.Section[CurrentSectionNum].SectionName, 0, MAX_STRING_LEN);
-			memcpy(IniData.Section[CurrentSectionNum].SectionName, &(CurrentString[1]), (CurrentStringSize - 2));
+			memcpy(IniData.Section[CurrentSectionNum].SectionName, &(CurrentString[1]), NameLen);
 			continue;
 		}
 
@@ -533,7 +537,7 @@ bool INI_FILE::SectionExists(wchar_t *SectionName)
 {
 	char cSectionName[MAX_STRING_LEN] = { 0x00 };
 
-	wcstombs(cSectionName, SectionName, MAX_STRING_LEN);
+	if (wcstombs(cSectionName, SectionName, MAX_STRING_LEN - 1) == (size_t)-1) return false;
 
 	return GetSection(cSectionName);
 }
@@ -545,8 +549,8 @@ bool INI_FILE::VariableExists(wchar_t *SectionName, wchar_t *VariableName)
 	char cSectionName[MAX_STRING_LEN] = { 0x00 };
 	char cVariableName[MAX_STRING_LEN] = { 0x00 };
 
-	wcstombs(cSectionName, SectionName, MAX_STRING_LEN);
-	wcstombs(cVariableName, VariableName, MAX_STRING_LEN);
+	if (wcstombs(cSectionName, SectionName, MAX_STRING_LEN - 1) == (size_t)-1) return false;
+	if (wcstombs(cVariableName, VariableName, MAX_STRING_LEN - 1) == (size_t)-1) return false;
 
 	return GetVariableInSectionPrivate(cSectionName, cVariableName, &Variable);
 }
@@ -556,8 +560,8 @@ bool INI_FILE::GetVariableInSection(wchar_t *SectionName, wchar_t *VariableName,
 	char cSectionName[MAX_STRING_LEN] = { 0x00 };
 	char cVariableName[MAX_STRING_LEN] = { 0x00 };
 
-	wcstombs(cSectionName, SectionName, MAX_STRING_LEN);
-	wcstombs(cVariableName, VariableName, MAX_STRING_LEN);
+	if (wcstombs(cSectionName, SectionName, MAX_STRING_LEN - 1) == (size_t)-1) return false;
+	if (wcstombs(cVariableName, VariableName, MAX_STRING_LEN - 1) == (size_t)-1) return false;
 
 	return GetVariableInSection(cSectionName, cVariableName, RetVariable);
 }
@@ -567,8 +571,8 @@ bool INI_FILE::GetVariableInSection(wchar_t *SectionName, wchar_t *VariableName,
 	char cSectionName[MAX_STRING_LEN] = { 0x00 };
 	char cVariableName[MAX_STRING_LEN] = { 0x00 };
 
-	wcstombs(cSectionName, SectionName, MAX_STRING_LEN);
-	wcstombs(cVariableName, VariableName, MAX_STRING_LEN);
+	if (wcstombs(cSectionName, SectionName, MAX_STRING_LEN - 1) == (size_t)-1) return false;
+	if (wcstombs(cVariableName, VariableName, MAX_STRING_LEN - 1) == (size_t)-1) return false;
 
 	return GetVariableInSection(cSectionName, cVariableName, RetVariable);
 }
@@ -578,8 +582,8 @@ bool INI_FILE::GetVariableInSection(wchar_t *SectionName, wchar_t *VariableName,
 	char cSectionName[MAX_STRING_LEN] = { 0x00 };
 	char cVariableName[MAX_STRING_LEN] = { 0x00 };
 
-	wcstombs(cSectionName, SectionName, MAX_STRING_LEN);
-	wcstombs(cVariableName, VariableName, MAX_STRING_LEN);
+	if (wcstombs(cSectionName, SectionName, MAX_STRING_LEN - 1) == (size_t)-1) return false;
+	if (wcstombs(cVariableName, VariableName, MAX_STRING_LEN - 1) == (size_t)-1) return false;
 
 	return GetVariableInSection(cSectionName, cVariableName, RetVariable);
 }
@@ -589,8 +593,8 @@ bool INI_FILE::GetVariableInSection(wchar_t *SectionName, wchar_t *VariableName,
 	char cSectionName[MAX_STRING_LEN] = { 0x00 };
 	char cVariableName[MAX_STRING_LEN] = { 0x00 };
 
-	wcstombs(cSectionName, SectionName, MAX_STRING_LEN);
-	wcstombs(cVariableName, VariableName, MAX_STRING_LEN);
+	if (wcstombs(cSectionName, SectionName, MAX_STRING_LEN - 1) == (size_t)-1) return false;
+	if (wcstombs(cVariableName, VariableName, MAX_STRING_LEN - 1) == (size_t)-1) return false;
 
 	return GetVariableInSection(cSectionName, cVariableName, RetVariable);
 }
@@ -599,7 +603,7 @@ bool INI_FILE::GetSectionVariablesList(wchar_t *SectionName, INI_SECTION_VARLIST
 {
 	char cSectionName[MAX_STRING_LEN] = { 0x00 };
 
-	wcstombs(cSectionName, SectionName, MAX_STRING_LEN);
+	if (wcstombs(cSectionName, SectionName, MAX_STRING_LEN - 1) == (size_t)-1) return false;
 
 	return GetSectionVariablesList(cSectionName, VariablesList);
 }

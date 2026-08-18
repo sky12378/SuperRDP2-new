@@ -5,6 +5,7 @@
 #include "Registry.h"
 #include <assert.h>
 #include <tchar.h>
+#include <new>
 #pragma comment(lib, "advapi32.lib")
 /////////////////////////////////////////////////////////////////////////////
 // CRegistry
@@ -292,14 +293,19 @@ BOOL CRegistry::Read(LPCTSTR lpValueName, std::string& lpVal)
     {
         return FALSE;
     }
+    // 与 wstring 版本一致：仅接受字符串类型，避免 REG_DWORD/BINARY 被当字符串返回乱码
+    if (dwType != REG_SZ && dwType != REG_EXPAND_SZ && dwType != REG_MULTI_SZ && dwType != REG_BINARY)
+    {
+        return FALSE;
+    }
     if (dwSize == 0)
     {
         lpVal.clear();
         return TRUE;
     }
 
-    // 第二次调用：实际读取，动态分配缓冲区
-    BYTE* pBuffer = new BYTE[dwSize];
+    // 第二次调用：实际读取，动态分配缓冲区（nothrow：失败返回 NULL 由下方判空，避免 bad_alloc 未捕获）
+    BYTE* pBuffer = new (std::nothrow) BYTE[dwSize];
     if (!pBuffer) return FALSE;
     lReturn = RegQueryValueEx(m_hKey, lpValueName, NULL, &dwType, pBuffer, &dwSize);
 
@@ -338,8 +344,8 @@ BOOL CRegistry::Read(LPCTSTR lpValueName, std::wstring& lpVal)
         return TRUE;
     }
 
-    // 第二次调用：实际读取，动态分配缓冲区
-    BYTE* pBuffer = new BYTE[dwSize + sizeof(wchar_t)]; // +1 确保终止符安全
+    // 第二次调用：实际读取，动态分配缓冲区（nothrow：失败返回 NULL 由下方判空，避免 bad_alloc 未捕获）
+    BYTE* pBuffer = new (std::nothrow) BYTE[dwSize + sizeof(wchar_t)]; // +1 确保终止符安全
     if (!pBuffer) return FALSE;
     memset(pBuffer, 0, dwSize + sizeof(wchar_t));
     lReturn = RegQueryValueEx(m_hKey, lpValueName, NULL, &dwType, pBuffer, &dwSize);
