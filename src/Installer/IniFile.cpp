@@ -208,7 +208,7 @@ bool INI_FILE::FillVariable(INI_SECTION_VARIABLE *Variable, char *Str, DWORD Str
 bool INI_FILE::Parse()
 {
 	DWORD CurrentStringNum = 0;
-	char CurrentString[512];
+	char CurrentString[2048];
 	DWORD CurrentStringSize = 0;
 
 	DWORD SectionsCount = 0;
@@ -220,7 +220,7 @@ bool INI_FILE::Parse()
 	// Calculate sections count
 	for (DWORD CurrentStringNum = 0; CurrentStringNum < FileStringsCount; CurrentStringNum++)
 	{
-		CurrentStringSize = GetFileStringFromNum(CurrentStringNum, CurrentString, 512);
+		CurrentStringSize = GetFileStringFromNum(CurrentStringNum, CurrentString, 2048);
 
 		if (CurrentString[0] == ';') continue; // It's a comment
 
@@ -236,7 +236,7 @@ bool INI_FILE::Parse()
 
 	for (DWORD CurrentStringNum = 0; CurrentStringNum < FileStringsCount; CurrentStringNum++)
 	{
-		CurrentStringSize = GetFileStringFromNum(CurrentStringNum, CurrentString, 512);
+		CurrentStringSize = GetFileStringFromNum(CurrentStringNum, CurrentString, 2048);
 
 		if (CurrentString[0] == ';') continue; // It's a comment
 
@@ -276,7 +276,7 @@ bool INI_FILE::Parse()
 
 	for (DWORD CurrentStringNum = 0; CurrentStringNum < FileStringsCount; CurrentStringNum++)
 	{
-		CurrentStringSize = GetFileStringFromNum(CurrentStringNum, CurrentString, 512);
+		CurrentStringSize = GetFileStringFromNum(CurrentStringNum, CurrentString, 2048);
 
 		if (CurrentString[0] == ';') // It's a comment
 		{
@@ -287,7 +287,7 @@ bool INI_FILE::Parse()
 		{
 			CurrentSectionNum++;
 			CurrentVariableNum = 0;
-			// 节名长度必须受限：行最长可达 511 字节，直接拷贝会溢出 SectionName[255] 破坏堆内存
+			// 节名长度必须受限：行最长可达 2047 字节，直接拷贝会溢出 SectionName[255] 破坏堆内存
 			DWORD NameLen = CurrentStringSize - 2;
 			if (NameLen > MAX_STRING_LEN - 1) NameLen = MAX_STRING_LEN - 1;
 			memset(IniData.Section[CurrentSectionNum].SectionName, 0, MAX_STRING_LEN);

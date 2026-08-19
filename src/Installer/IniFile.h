@@ -89,6 +89,9 @@ public:
 	INI_FILE(wchar_t*);
 	~INI_FILE();
 
+	// 解析出的节数量，用于区分"加载失败/空文件"与"版本不支持"
+	DWORD GetSectionCount() const { return IniData.SectionCount; }
+
 	// char block
 	bool SectionExists(char *SectionName);
 	bool VariableExists(char *SectionName, char *VariableName);

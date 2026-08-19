@@ -206,6 +206,8 @@ BOOL CRegistry::Read(LPCTSTR lpValueName, int* pnVal)
    
     if(lReturn==ERROR_SUCCESS)
     {
+        // 仅接受 REG_DWORD，避免 REG_SZ/BINARY 等类型被当数值误读
+        if (dwType != REG_DWORD) return FALSE;
         *pnVal=(int)dwDest;
         return TRUE;
     }
@@ -226,6 +228,8 @@ BOOL CRegistry::Read(LPCTSTR lpValueName, DWORD* pdwVal)
    
     if(lReturn==ERROR_SUCCESS)
     {
+        // 仅接受 REG_DWORD，避免 REG_SZ/BINARY 等类型被当数值误读
+        if (dwType != REG_DWORD) return FALSE;
         *pdwVal=dwDest;
         return TRUE;
     }
@@ -293,8 +297,8 @@ BOOL CRegistry::Read(LPCTSTR lpValueName, std::string& lpVal)
     {
         return FALSE;
     }
-    // 与 wstring 版本一致：仅接受字符串类型，避免 REG_DWORD/BINARY 被当字符串返回乱码
-    if (dwType != REG_SZ && dwType != REG_EXPAND_SZ && dwType != REG_MULTI_SZ && dwType != REG_BINARY)
+    // 与 wstring 版本口径一致：仅接受字符串类型（拒绝 REG_BINARY），避免二进制/数值被当字符串返回
+    if (dwType != REG_SZ && dwType != REG_EXPAND_SZ && dwType != REG_MULTI_SZ)
     {
         return FALSE;
     }

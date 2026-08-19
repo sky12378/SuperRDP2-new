@@ -215,7 +215,10 @@ BOOL __stdcall GetFileVersion(LPCWSTR lptstrFilename, FILE_VERSION* FileVersion)
         WORD             Children;
     } VS_VERSIONINFO;
 
-    HMODULE hFile = LoadLibraryExW(lptstrFilename, NULL, LOAD_LIBRARY_AS_DATAFILE);
+#ifndef LOAD_LIBRARY_AS_IMAGE_RESOURCE
+#define LOAD_LIBRARY_AS_IMAGE_RESOURCE 0x20   // 部分旧 MinGW 头文件缺此宏；叠加后防数据文件映射被处理导入/重定位
+#endif
+    HMODULE hFile = LoadLibraryExW(lptstrFilename, NULL, LOAD_LIBRARY_AS_DATAFILE | LOAD_LIBRARY_AS_IMAGE_RESOURCE);
     if (!hFile)
     {
         return false;
@@ -278,6 +281,13 @@ bool CheckTermsrvVersion(wchar_t *IniPath)
     if (IniFile == NULL)
     {
         printf("[-] Failed to load configuration\r\n");
+        return false;
+    }
+
+    // 零字节/无效 INI 解析出的节数为 0，若直接报 "version not supported" 会误导用户，应提示配置加载失败
+    if (IniFile->GetSectionCount() == 0)
+    {
+        printf("[-] Failed to load configuration: INI file is empty or has no valid sections.\r\n");
         return false;
     }
 
@@ -471,8 +481,15 @@ bool SvcStart(wchar_t* SvcName)
             // 刚终止过服务进程时 SCM 可能尚未同步停止状态，稍候重试一次
             Sleep(2000);
             if (!StartService(hSvc, 0, NULL)) {
-                printf("[*] Start service failed. %d\n", GetLastError());
-                goto __exit;
+                err = GetLastError();
+                // 与 1056 分支对称：二次失败查状态确认是否实际已运行，避免误判
+                SERVICE_STATUS st = { 0 };
+                bool running = QueryServiceStatus(hSvc, &st) &&
+                    (st.dwCurrentState == SERVICE_RUNNING);
+                if (!running) {
+                    printf("[*] Start service failed. %d\n", err);
+                    goto __exit;
+                }
             }
         }
         else {
@@ -669,6 +686,7 @@ __again:
     else {
         if (Started) {
             printf("Failed to set up TermService. Unknown error.\n");
+            printf("Press Enter to continue...");
             getchar();
             again = false;
             goto __exit;
@@ -839,6 +857,7 @@ int ReleaseFile(LPCTSTR path, LPCTSTR res_type, WORD res_id)
 }
 
 bool AddPrivilege(const wchar_t* SePriv);
+std::wstring ExpandPath(const wchar_t* Path);
 
 bool InstallWrapper(wchar_t* wrapper)
 {
@@ -850,10 +869,26 @@ bool InstallWrapper(wchar_t* wrapper)
     bool ok = true;
     bool done = false;   // 是否走到末尾输出阶段（早期 goto 失败路径不算成功）
     DWORD sysDirLen = 0;  // 必须在首个 goto __exit 之前声明，避免 goto 跨越初始化
+    bool svcKilled = false;   // TermService 进程是否已被终止：中途失败时必须恢复服务，避免 RDP 断线
 
     if (Installed) {
-        printf("[*] RDP Wrapper Library is already installed.\n");
-        return true;   // 无需安装，幂等视为成功
+        // 幂等早退必须以包装文件真实存在为前提：注册表指向 rdpwrap.dll 但文件被删/损坏
+        // （杀软隔离、手动清理）时早退会报成功，而 TermService 实际无法加载包装库；
+        // 此时不早退，落入下方完整安装流程完成修复
+        std::wstring dllPath = ExpandPath(TermServicePath.c_str());
+        bool filesOk = false;
+        if (!dllPath.empty() && dllPath.length() < MAX_PATH) {
+            wchar_t chkIni[MAX_PATH] = { 0 };
+            wcscpy_s(chkIni, dllPath.c_str());
+            PathRemoveExtension(chkIni);
+            StrCatW(chkIni, L".ini");
+            filesOk = PathFileExistsW(dllPath.c_str()) && PathFileExistsW(chkIni);
+        }
+        if (filesOk) {
+            printf("[*] RDP Wrapper Library is already installed.\n");
+            return true;   // 无需安装，幂等视为成功
+        }
+        printf("[!] Installed but wrapper files are missing/damaged, reinstalling...\n");
     }
 
     if (Arch == 64) {
@@ -899,6 +934,7 @@ bool InstallWrapper(wchar_t* wrapper)
     if (!KillProcess(TermServicePID)) {
         goto __exit;
     }
+    svcKilled = true;
 
     Sleep(1000);
 
@@ -944,7 +980,9 @@ bool InstallWrapper(wchar_t* wrapper)
     CheckTermsrvDependencies();
 
     for (int i = 0; i < ShareSvcCount; i++) {
-        SvcStart(ShareSvc[i]);
+        if (!SvcStart(ShareSvc[i])) {
+            printf("[!] Start shared service %ws failed (may affect RDP)\n", ShareSvc[i]);
+        }
     }
 
     Sleep(500);
@@ -972,6 +1010,13 @@ bool InstallWrapper(wchar_t* wrapper)
     }
 
 __exit:
+
+    // 先杀进程再安装：中途失败（文件复制失败等）时 ServiceDll 仍指向旧库，
+    // 必须尽力重启恢复 TermService，避免 RDP 彻底断线
+    if (svcKilled && !done) {
+        printf("[!] Install aborted after service termination, restoring TermService...\n");
+        SvcStart(TermService);
+    }
 
     if (Arch == 64) {
         RevertWowRedirection();
@@ -1075,6 +1120,8 @@ bool UninstallWrapper()
     bool result = false;
     bool ok = true;   // 聚合服务重启/注册表/防火墙等后续步骤结果，必须声明在首个 goto 之前
     CRegistry reg;
+    wchar_t rfxvmtPath[MAX_PATH] = { 0 };
+    DWORD rfxLen = 0;
 
     if (!Installed) {
         printf("[*] RDP Wrapper Library is not installed.\n");
@@ -1121,8 +1168,24 @@ bool UninstallWrapper()
 
     DeleteFiles();
 
+    // rfxvmt.dll 为历史遗留组件（当前 RDPWrap 代码无引用），卸载时清理避免永久残留
+    rfxLen = GetSystemDirectoryW(rfxvmtPath, MAX_PATH);
+    if (rfxLen != 0 && rfxLen < MAX_PATH) {
+        PathAppendW(rfxvmtPath, L"rfxvmt.dll");
+        if (PathFileExistsW(rfxvmtPath)) {
+            if (DeleteFile(rfxvmtPath)) {
+                printf("[+] Removed file: %ws\n", rfxvmtPath);
+            }
+            else {
+                printf("[-] DeleteFile error (code %d).\n", GetLastError());
+            }
+        }
+    }
+
     for (int i = 0; i < ShareSvcCount; i++) {
-        SvcStart(ShareSvc[i]);
+        if (!SvcStart(ShareSvc[i])) {
+            printf("[!] Start shared service %ws failed (may affect RDP)\n", ShareSvc[i]);
+        }
     }
 
     Sleep(500);
@@ -1182,7 +1245,9 @@ bool ForceRestartTerminalService()
     }
 
     for (int i = 0; i < ShareSvcCount; i++) {
-        SvcStart(ShareSvc[i]);
+        if (!SvcStart(ShareSvc[i])) {
+            printf("[!] Start shared service %ws failed (may affect RDP)\n", ShareSvc[i]);
+        }
     }
 
     Sleep(500);
